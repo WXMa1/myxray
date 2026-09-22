@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       xray_ref:
-        description: "XTLS/Xray-core branch, tag, or commit"
+        description: "XTLS/Xray-core ref (main = latest source; or tag/commit)"
         required: true
         default: "main"
         type: string
@@ -13,39 +13,18 @@ permissions:
   contents: read
 
 jobs:
-  patch-test-build:
+  # 先把 main/tag/commit 解析成固定 SHA。
+  # 这样一次 workflow 中所有平台保证使用完全相同的 Xray 源码。
+  resolve-xray:
+    name: Resolve Xray source
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - goos: linux
-            goarch: amd64
-            suffix: linux-amd64
-            ext: ""
-          - goos: linux
-            goarch: arm64
-            suffix: linux-arm64
-            ext: ""
-          - goos: windows
-            goarch: amd64
-            suffix: windows-amd64
-            ext: ".exe"
-          - goos: darwin
-            goarch: amd64
-            suffix: darwin-amd64
-            ext: ""
-          - goos: darwin
-            goarch: arm64
-            suffix: darwin-arm64
-            ext: ""
+
+    outputs:
+      sha: ${{ steps.meta.outputs.sha }}
+      short_sha: ${{ steps.meta.outputs.short_sha }}
+      describe: ${{ steps.meta.outputs.describe }}
 
     steps:
-      - name: Checkout patch repository
-        uses: actions/checkout@v7
-        with:
-          path: patch-repo
-
       - name: Checkout upstream Xray-core
         uses: actions/checkout@v7
         with:
@@ -54,6 +33,94 @@ jobs:
           path: xray-core
           fetch-depth: 0
 
+      - name: Resolve exact commit
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SHA="$(git -C xray-core rev-parse HEAD)"
+          SHORT_SHA="$(git -C xray-core rev-parse --short=7 HEAD)"
+          DESCRIBE="$(git -C xray-core describe --tags --always --dirty)"
+
+          echo "sha=${SHA}" >> "$GITHUB_OUTPUT"
+          echo "short_sha=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          echo "describe=${DESCRIBE}" >> "$GITHUB_OUTPUT"
+
+          echo "========================================"
+          echo "Requested ref : ${{ inputs.xray_ref }}"
+          echo "Resolved SHA  : ${SHA}"
+          echo "Short SHA     : ${SHORT_SHA}"
+          echo "Describe      : ${DESCRIBE}"
+          echo "========================================"
+
+  patch-test-build:
+    name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
+    needs: resolve-xray
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+            suffix: linux-amd64
+            ext: ""
+
+          - goos: linux
+            goarch: arm64
+            suffix: linux-arm64
+            ext: ""
+
+          - goos: windows
+            goarch: amd64
+            suffix: windows-amd64
+            ext: ".exe"
+
+          - goos: darwin
+            goarch: amd64
+            suffix: darwin-amd64
+            ext: ""
+
+          - goos: darwin
+            goarch: arm64
+            suffix: darwin-arm64
+            ext: ""
+
+    steps:
+      # 这里 checkout 的是你自己的 WXMa1/myxray，
+      # 用于取得 scripts/patch_weighted_balancer.py
+      - name: Checkout patch repository
+        uses: actions/checkout@v7
+        with:
+          path: patch-repo
+
+      # 不再直接 checkout main，
+      # 而是 checkout 前面 resolve 得到的固定 commit SHA。
+      - name: Checkout exact upstream Xray-core commit
+        uses: actions/checkout@v7
+        with:
+          repository: XTLS/Xray-core
+          ref: ${{ needs.resolve-xray.outputs.sha }}
+          path: xray-core
+          fetch-depth: 0
+
+      - name: Show source information
+        shell: bash
+        run: |
+          echo "========================================"
+          echo "Xray requested ref : ${{ inputs.xray_ref }}"
+          echo "Xray exact SHA     : ${{ needs.resolve-xray.outputs.sha }}"
+          echo "Xray short SHA     : ${{ needs.resolve-xray.outputs.short_sha }}"
+          echo "Xray describe      : ${{ needs.resolve-xray.outputs.describe }}"
+          echo "========================================"
+
+          git -C xray-core log -1 --oneline
+
+      # Go 版本直接跟随 Xray 上游 go.mod，
+      # 不在我们自己的 Action 里写死 Go 版本。
       - name: Set up Go from upstream go.mod
         uses: actions/setup-go@v7
         with:
@@ -62,42 +129,87 @@ jobs:
           cache: true
           cache-dependency-path: xray-core/go.sum
 
+      # 应用 weightedRoundRobin 补丁
       - name: Apply weighted balancer patch
         working-directory: xray-core
-        run: python3 ../patch-repo/scripts/patch_weighted_balancer.py
-
-      - name: Verify patch and formatting
-        working-directory: xray-core
+        shell: bash
         run: |
-          git diff --check
-          git status --short
-          git diff -- app/router/config.go app/router/strategy_weightedroundrobin.go infra/conf/router.go infra/conf/router_strategy.go
+          set -euo pipefail
 
-      - name: Download dependencies
+          python3 ../patch-repo/scripts/patch_weighted_balancer.py
+
+      # 检查 patch 有没有异常
+      - name: Verify patch
+        working-directory: xray-core
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "===== git diff --check ====="
+          git diff --check
+
+          echo
+          echo "===== git status ====="
+          git status --short
+
+          echo
+          echo "===== weightedRoundRobin references ====="
+          grep -Rni \
+            --exclude='*.pb.go' \
+            "weightedRoundRobin" \
+            app/router infra/conf || true
+
+          echo
+          echo "===== Patch diff ====="
+          git diff -- \
+            app/router/config.go \
+            app/router/strategy_weightedroundrobin.go \
+            app/router/strategy_weightedroundrobin_test.go \
+            infra/conf/router.go \
+            infra/conf/router_strategy.go
+
+      - name: Download Go dependencies
         working-directory: xray-core
         run: go mod download
 
-      # Xray's router/conf tests require resources/geoip.dat and resources/geosite.dat.
-      # Upstream normally gets them from a repository-local Actions cache. Our repo
-      # cannot access XTLS/Xray-core's cache, so fetch the same source used upstream.
+      # Xray 自带 app/router 和 infra/conf 测试会读取：
+      #
+      # resources/geoip.dat
+      # resources/geosite.dat
+      #
+      # 只让 linux/amd64 跑一次完整测试，因此只在这个 matrix
+      # 下载 geodata。
       - name: Prepare geodata for unit tests
         if: matrix.goos == 'linux' && matrix.goarch == 'amd64'
         working-directory: xray-core
         shell: bash
         run: |
           set -euo pipefail
+
           mkdir -p resources
 
           BASE="https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release"
+
           for name in geoip geosite; do
             echo "Downloading ${name}.dat"
-            curl -fL --retry 5 --retry-delay 2 \
+
+            curl -fL \
+              --retry 5 \
+              --retry-delay 2 \
               "${BASE}/${name}.dat" \
               -o "resources/${name}.dat"
-            curl -fL --retry 5 --retry-delay 2 \
+
+            echo "Downloading ${name}.dat.sha256sum"
+
+            curl -fL \
+              --retry 5 \
+              --retry-delay 2 \
               "${BASE}/${name}.dat.sha256sum" \
               -o "resources/${name}.dat.sha256sum"
           done
+
+          echo
+          echo "===== Verify geodata SHA256 ====="
 
           (
             cd resources
@@ -105,12 +217,23 @@ jobs:
             sha256sum -c geosite.dat.sha256sum
           )
 
-      # Run tests once; matrix builds all targets after the same patch.
+      # 完整 router/conf 测试只执行一次。
+      #
+      # 因为所有 matrix 使用的是：
+      # 1. 同一个 Xray commit
+      # 2. 同一个 patch
+      #
+      # 所以没必要 Windows/macOS 再重复测试。
       - name: Unit tests
         if: matrix.goos == 'linux' && matrix.goarch == 'amd64'
         working-directory: xray-core
-        run: go test -timeout 1h ./app/router ./infra/conf
+        run: |
+          go test \
+            -timeout 1h \
+            ./app/router \
+            ./infra/conf
 
+      # 全部平台在 ubuntu runner 上交叉编译
       - name: Build Xray
         working-directory: xray-core
         env:
@@ -120,9 +243,21 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
           mkdir -p dist
+
           COMMID="$(git describe --always --dirty)"
+
           OUTPUT="dist/xray-${{ matrix.suffix }}${{ matrix.ext }}"
+
+          echo "========================================"
+          echo "Building Xray"
+          echo "GOOS     : ${GOOS}"
+          echo "GOARCH   : ${GOARCH}"
+          echo "Commit   : ${COMMID}"
+          echo "Output   : ${OUTPUT}"
+          echo "========================================"
+
           go build \
             -o "$OUTPUT" \
             -trimpath \
@@ -130,13 +265,27 @@ jobs:
             -gcflags="all=-l=4" \
             -ldflags="-X github.com/xtls/xray-core/core.build=${COMMID} -s -w -buildid=" \
             -v ./main
-          sha256sum "$OUTPUT" > "${OUTPUT}.sha256"
 
-      - name: Upload binary
+          echo
+          echo "===== SHA256 ====="
+
+          sha256sum "$OUTPUT" > "${OUTPUT}.sha256"
+          cat "${OUTPUT}.sha256"
+
+          echo
+          echo "===== Build result ====="
+
+          ls -lh dist/
+
+      # 上传到 GitHub Actions Artifacts
+      - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
-          name: xray-weighted-${{ matrix.suffix }}
+          name: xray-weighted-${{ matrix.suffix }}-${{ needs.resolve-xray.outputs.short_sha }}
+
           path: |
             xray-core/dist/xray-${{ matrix.suffix }}${{ matrix.ext }}
             xray-core/dist/xray-${{ matrix.suffix }}${{ matrix.ext }}.sha256
+
           if-no-files-found: error
+          compression-level: 9
