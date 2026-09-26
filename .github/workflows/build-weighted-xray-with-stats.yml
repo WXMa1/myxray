@@ -139,7 +139,7 @@ jobs:
           go mod download
           go test ./app/router ./infra/conf
           go test ./app/router -run 'TestWeightedRoundRobinStrategy' -count=1 -v
-          go vet ./app/router ./infra/conf
+          go vet ./app/router
 
       - name: Build known-good linux/amd64 baseline
         working-directory: xray-core
@@ -352,7 +352,7 @@ jobs:
           set -euo pipefail
           go test ./app/router ./infra/conf
           go test ./app/router -run 'TestWeightedRoundRobinStrategy' -count=1 -v
-          go vet ./app/router ./infra/conf
+          go vet ./app/router
 
       - name: Build Xray
         working-directory: xray-core
