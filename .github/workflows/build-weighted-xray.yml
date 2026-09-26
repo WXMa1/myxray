@@ -67,6 +67,57 @@ jobs:
         working-directory: xray-core
         run: python3 "$GITHUB_WORKSPACE/patch-repo/scripts/patch_weighted_balancer.py"
 
+      - name: Prepare Xray geodata test assets
+        working-directory: xray-core
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p resources
+
+          fetch_geodat() {
+            local remote_name="$1"
+            local local_name="$2"
+            local base="https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release"
+            local expected
+
+            echo "Resolving SHA256 for ${remote_name}.dat..."
+            expected="$(
+              curl --fail --silent --show-error --location \
+                --retry 5 --retry-delay 2 --retry-all-errors \
+                -H "Authorization: Bearer ${GH_TOKEN}" \
+                "${base}/${remote_name}.dat.sha256sum" \
+              | awk 'NR==1 {print $1}'
+            )"
+
+            if ! [[ "$expected" =~ ^[0-9a-fA-F]{64}$ ]]; then
+              echo "ERROR: invalid SHA256 metadata for ${remote_name}.dat: ${expected}"
+              exit 1
+            fi
+
+            if [ -s "resources/${local_name}.dat" ]; then
+              current="$(sha256sum "resources/${local_name}.dat" | awk '{print $1}')"
+              if [ "$current" = "$expected" ]; then
+                echo "resources/${local_name}.dat already matches ${expected}"
+                return 0
+              fi
+            fi
+
+            echo "Downloading ${remote_name}.dat..."
+            curl --fail --silent --show-error --location \
+              --retry 5 --retry-delay 2 --retry-all-errors \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              "${base}/${remote_name}.dat" \
+              -o "resources/${local_name}.dat"
+
+            echo "${expected}  resources/${local_name}.dat" | sha256sum -c -
+          }
+
+          fetch_geodat geoip geoip
+          fetch_geodat geosite geosite
+          ls -lh resources/geoip.dat resources/geosite.dat
+
       - name: Verify known-good baseline
         working-directory: xray-core
         shell: bash
@@ -170,6 +221,57 @@ jobs:
       - name: Apply balancer-only WRR patch
         working-directory: xray-core
         run: python3 "$GITHUB_WORKSPACE/patch-repo/scripts/patch_weighted_balancer.py"
+
+      - name: Prepare Xray geodata test assets
+        working-directory: xray-core
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p resources
+
+          fetch_geodat() {
+            local remote_name="$1"
+            local local_name="$2"
+            local base="https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release"
+            local expected
+
+            echo "Resolving SHA256 for ${remote_name}.dat..."
+            expected="$(
+              curl --fail --silent --show-error --location \
+                --retry 5 --retry-delay 2 --retry-all-errors \
+                -H "Authorization: Bearer ${GH_TOKEN}" \
+                "${base}/${remote_name}.dat.sha256sum" \
+              | awk 'NR==1 {print $1}'
+            )"
+
+            if ! [[ "$expected" =~ ^[0-9a-fA-F]{64}$ ]]; then
+              echo "ERROR: invalid SHA256 metadata for ${remote_name}.dat: ${expected}"
+              exit 1
+            fi
+
+            if [ -s "resources/${local_name}.dat" ]; then
+              current="$(sha256sum "resources/${local_name}.dat" | awk '{print $1}')"
+              if [ "$current" = "$expected" ]; then
+                echo "resources/${local_name}.dat already matches ${expected}"
+                return 0
+              fi
+            fi
+
+            echo "Downloading ${remote_name}.dat..."
+            curl --fail --silent --show-error --location \
+              --retry 5 --retry-delay 2 --retry-all-errors \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              "${base}/${remote_name}.dat" \
+              -o "resources/${local_name}.dat"
+
+            echo "${expected}  resources/${local_name}.dat" | sha256sum -c -
+          }
+
+          fetch_geodat geoip geoip
+          fetch_geodat geosite geosite
+          ls -lh resources/geoip.dat resources/geosite.dat
 
       - name: Test WRR
         if: matrix.goos == 'linux' && matrix.goarch == 'amd64'
