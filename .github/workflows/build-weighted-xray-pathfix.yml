@@ -1,0 +1,240 @@
+name: Build patched Xray WRR
+
+on:
+  workflow_dispatch:
+    inputs:
+      xray_ref:
+        description: "XTLS/Xray-core branch, tag, full SHA, or short SHA"
+        required: true
+        default: "main"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  baseline-compat:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout patch repository
+        uses: actions/checkout@v7
+        with:
+          path: patch-repo
+
+      - name: Locate patch script
+        id: patcher
+        shell: bash
+        run: |
+          set -euo pipefail
+          candidates=(
+            "$GITHUB_WORKSPACE/patch-repo/scripts/patch_weighted_balancer.py"
+            "$GITHUB_WORKSPACE/patch-repo/patch_weighted_balancer.py"
+          )
+
+          for p in "${candidates[@]}"; do
+            if [ -f "$p" ]; then
+              echo "path=$p" >> "$GITHUB_OUTPUT"
+              echo "Using patcher: $p"
+              exit 0
+            fi
+          done
+
+          mapfile -t found < <(find "$GITHUB_WORKSPACE/patch-repo" -maxdepth 5 -type f -name 'patch_weighted_balancer.py' -print)
+          if [ "${#found[@]}" -eq 1 ]; then
+            echo "path=${found[0]}" >> "$GITHUB_OUTPUT"
+            echo "Using discovered patcher: ${found[0]}"
+            exit 0
+          fi
+
+          echo "ERROR: could not locate patch_weighted_balancer.py"
+          echo "Repository files:"
+          find "$GITHUB_WORKSPACE/patch-repo" -maxdepth 4 -type f -print | sort
+          exit 1
+
+      - name: Checkout Xray repository for known-good baseline
+        uses: actions/checkout@v7
+        with:
+          repository: XTLS/Xray-core
+          path: xray-core
+          fetch-depth: 0
+
+      - name: Resolve known-good baseline commit
+        working-directory: xray-core
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --force --tags origin '+refs/heads/*:refs/remotes/origin/*'
+          git rev-parse --verify 'd562d89^{commit}'
+          git checkout --detach "$(git rev-parse 'd562d89^{commit}')"
+          echo "known-good baseline: $(git rev-parse HEAD)"
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: xray-core/go.mod
+          check-latest: true
+          cache: true
+          cache-dependency-path: xray-core/go.sum
+
+      - name: Apply balancer-only WRR patch
+        working-directory: xray-core
+        run: python3 "${{ steps.patcher.outputs.path }}"
+
+      - name: Verify known-good baseline
+        working-directory: xray-core
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --binary > /tmp/first.patch
+          python3 "${{ steps.patcher.outputs.path }}"
+          git diff --binary > /tmp/second.patch
+          cmp /tmp/first.patch /tmp/second.patch
+          git diff --check
+          go mod download
+          go test ./app/router ./infra/conf
+          go test ./app/router -run 'TestWeightedRoundRobinStrategy' -count=1 -v
+          go vet ./app/router ./infra/conf
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+            go build -o /tmp/xray-baseline -trimpath -buildvcs=false -ldflags='-s -w -buildid=' ./main
+          /tmp/xray-baseline version
+
+  build:
+    needs: baseline-compat
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {goos: linux,   goarch: amd64, suffix: linux-amd64,   ext: ""}
+          - {goos: linux,   goarch: arm64, suffix: linux-arm64,   ext: ""}
+          - {goos: windows, goarch: amd64, suffix: windows-amd64, ext: ".exe"}
+          - {goos: darwin,  goarch: amd64, suffix: darwin-amd64,  ext: ""}
+          - {goos: darwin,  goarch: arm64, suffix: darwin-arm64,  ext: ""}
+
+    steps:
+      - name: Checkout patch repository
+        uses: actions/checkout@v7
+        with:
+          path: patch-repo
+
+      - name: Locate patch script
+        id: patcher
+        shell: bash
+        run: |
+          set -euo pipefail
+          candidates=(
+            "$GITHUB_WORKSPACE/patch-repo/scripts/patch_weighted_balancer.py"
+            "$GITHUB_WORKSPACE/patch-repo/patch_weighted_balancer.py"
+          )
+
+          for p in "${candidates[@]}"; do
+            if [ -f "$p" ]; then
+              echo "path=$p" >> "$GITHUB_OUTPUT"
+              echo "Using patcher: $p"
+              exit 0
+            fi
+          done
+
+          mapfile -t found < <(find "$GITHUB_WORKSPACE/patch-repo" -maxdepth 5 -type f -name 'patch_weighted_balancer.py' -print)
+          if [ "${#found[@]}" -eq 1 ]; then
+            echo "path=${found[0]}" >> "$GITHUB_OUTPUT"
+            echo "Using discovered patcher: ${found[0]}"
+            exit 0
+          fi
+
+          echo "ERROR: could not locate patch_weighted_balancer.py"
+          echo "Repository files:"
+          find "$GITHUB_WORKSPACE/patch-repo" -maxdepth 4 -type f -print | sort
+          exit 1
+
+      - name: Checkout upstream Xray-core
+        uses: actions/checkout@v7
+        with:
+          repository: XTLS/Xray-core
+          path: xray-core
+          fetch-depth: 0
+
+      - name: Resolve requested Xray ref
+        working-directory: xray-core
+        shell: bash
+        env:
+          XRAY_REF: ${{ inputs.xray_ref }}
+        run: |
+          set -euo pipefail
+          git fetch --force --tags origin '+refs/heads/*:refs/remotes/origin/*'
+
+          if git rev-parse --verify --quiet "${XRAY_REF}^{commit}" >/dev/null; then
+            TARGET="$(git rev-parse "${XRAY_REF}^{commit}")"
+          elif git rev-parse --verify --quiet "origin/${XRAY_REF}^{commit}" >/dev/null; then
+            TARGET="$(git rev-parse "origin/${XRAY_REF}^{commit}")"
+          else
+            git fetch --force origin "$XRAY_REF"
+            TARGET="$(git rev-parse 'FETCH_HEAD^{commit}')"
+          fi
+
+          git checkout --detach "$TARGET"
+          echo "requested_ref=$XRAY_REF"
+          echo "resolved_commit=$(git rev-parse HEAD)"
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: xray-core/go.mod
+          check-latest: true
+          cache: true
+          cache-dependency-path: xray-core/go.sum
+
+      - name: Record exact upstream revision
+        id: upstream
+        working-directory: xray-core
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "short=$(git rev-parse --short=12 HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Apply balancer-only WRR patch
+        working-directory: xray-core
+        run: python3 "${{ steps.patcher.outputs.path }}"
+
+      - name: Test WRR
+        if: matrix.goos == 'linux' && matrix.goarch == 'amd64'
+        working-directory: xray-core
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --check
+          go mod download
+          go test ./app/router ./infra/conf
+          go test ./app/router -run 'TestWeightedRoundRobinStrategy' -count=1 -v
+          go vet ./app/router ./infra/conf
+
+      - name: Build Xray
+        working-directory: xray-core
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          COMMID="$(git describe --always --dirty)"
+          OUTPUT="dist/xray-${{ matrix.suffix }}${{ matrix.ext }}"
+          go build \
+            -o "$OUTPUT" \
+            -trimpath \
+            -buildvcs=false \
+            -gcflags="all=-l=4" \
+            -ldflags="-X github.com/xtls/xray-core/core.build=${COMMID} -s -w -buildid=" \
+            -v ./main
+          sha256sum "$OUTPUT" > "${OUTPUT}.sha256"
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: xray-weighted-${{ matrix.suffix }}-${{ steps.upstream.outputs.short }}
+          path: |
+            xray-core/dist/xray-${{ matrix.suffix }}${{ matrix.ext }}
+            xray-core/dist/xray-${{ matrix.suffix }}${{ matrix.ext }}.sha256
+          if-no-files-found: error
