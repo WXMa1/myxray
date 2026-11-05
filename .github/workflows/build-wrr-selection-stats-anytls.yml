@@ -1,8 +1,8 @@
 
-# Independent combined build: WRR + native selection stats + AnyTLS.
-# The original WRR patch must be checked out at patch-repo/ for its script to exist.
-# Uses the source patch from WXMa1/myxray; does not modify other workflows.
-# AnyTLS source pinned to 0721f9b543a6c20f503c1ac181eeb27d98d808f2.
+# Xray-core + WRR + Selection Stats + AnyTLS
+# Standalone combined build workflow.
+# WRR patch is loaded from the current myxray repository.
+# AnyTLS source is pinned to a known commit.
 
 name: Build Xray with WRR + Selection Stats + AnyTLS
 
@@ -23,6 +23,7 @@ jobs:
     name: Combined / ${{ matrix.goos }}-${{ matrix.goarch }}
     runs-on: ubuntu-latest
     timeout-minutes: 55
+
     strategy:
       fail-fast: false
       matrix:
@@ -34,6 +35,10 @@ jobs:
           - { goos: darwin,  goarch: arm64, suffix: darwin-arm64,  ext: '' }
 
     steps:
+      # --------------------------------------------------
+      # 1. Checkout repositories
+      # --------------------------------------------------
+
       - name: Checkout your original WRR patch repository
         uses: actions/checkout@v4
         with:
@@ -56,96 +61,170 @@ jobs:
           path: anytls-source
           persist-credentials: false
 
+      # --------------------------------------------------
+      # 2. Verify source revisions
+      # --------------------------------------------------
+
       - name: Check source revisions
         id: revisions
         shell: bash
         run: |
           set -euo pipefail
+
           expected='0721f9b543a6c20f503c1ac181eeb27d98d808f2'
           actual="$(git -C anytls-source rev-parse HEAD)"
+
           if [[ "$actual" != "$expected" ]]; then
             echo 'ERROR: AnyTLS source revision differs from the pinned commit.' >&2
             exit 1
           fi
+
           upstream="$(git -C xray-core rev-parse HEAD)"
+
           echo "upstream=$upstream" >> "$GITHUB_OUTPUT"
           echo "upstream_short=${upstream:0:12}" >> "$GITHUB_OUTPUT"
+
           echo "Xray upstream: $upstream"
           echo "WRR patch repo: $(git -C patch-repo rev-parse HEAD)"
           echo "AnyTLS source: $actual"
+
+      # --------------------------------------------------
+      # 3. Verify WRR patch
+      # --------------------------------------------------
 
       - name: Verify original WRR patch script is present
         shell: bash
         run: |
           set -euo pipefail
+
           script="$GITHUB_WORKSPACE/patch-repo/scripts/patch_weighted_balancer_with_stats.py"
+
           if [[ ! -f "$script" ]]; then
             echo "ERROR: missing WRR patch script: $script" >&2
-            echo 'Top-level files in checked-out patch repository:' >&2
+            echo 'Files in checked-out repository:' >&2
+
             find patch-repo -maxdepth 3 -type f | head -60 >&2
-            echo 'Check which ref/path the original WRR workflow checks out as patch-repo.' >&2
+
             exit 1
           fi
+
           python3 -m py_compile "$script"
+
           echo "WRR script found: $script"
+
+      # --------------------------------------------------
+      # 4. Apply WRR + Selection Stats
+      #
+      # FIX V4:
+      # The original patch script must execute from the
+      # Xray-core source root, because it reads go.mod
+      # and other source files using relative paths.
+      # --------------------------------------------------
 
       - name: Apply original WRR + native selection-counter patch
         shell: bash
         run: |
           set -euo pipefail
-          # Run from the actual GITHUB_WORKSPACE root, as the original WRR Action does.
-          # Never override GITHUB_WORKSPACE to patch-repo or a nested checkout path.
-          python3 "$GITHUB_WORKSPACE/patch-repo/scripts/patch_weighted_balancer_with_stats.py"
 
-          # Include new untracked files when verifying the source changes.
+          echo "Applying WRR + Selection Stats patch..."
+
+          # Run the patch INSIDE the Xray-core source root.
+          (
+            cd "$GITHUB_WORKSPACE/xray-core"
+
+            test -f go.mod
+
+            python3 "$GITHUB_WORKSPACE/patch-repo/scripts/patch_weighted_balancer_with_stats.py"
+          )
+
+          echo "WRR patch execution completed."
+
+          # Detect newly created and modified source files.
           git -C xray-core add -N .
           git -C xray-core diff --check
-          git -C xray-core diff --no-ext-diff --unified=0 > wrr-change.patch
-          git -C xray-core diff --name-only > wrr-changed-files.txt
-          if [[ ! -s wrr-changed-files.txt ]]; then
-            echo 'ERROR: WRR patch produced no changes to the Xray source.' >&2
+
+          git -C xray-core diff \
+            --no-ext-diff \
+            --unified=0 \
+            > "$GITHUB_WORKSPACE/wrr-change.patch"
+
+          git -C xray-core diff --name-only \
+            > "$GITHUB_WORKSPACE/wrr-changed-files.txt"
+
+          if [[ ! -s "$GITHUB_WORKSPACE/wrr-changed-files.txt" ]]; then
+            echo 'ERROR: WRR patch produced no changes to Xray source.' >&2
             exit 1
           fi
-          # Fail rather than silently publish an AnyTLS-only build.
-          if ! grep -Eiq 'weighted|wrr|round.?robin' wrr-change.patch; then
-            echo 'ERROR: WRR changes were not found in the source diff.' >&2
+
+          # Verify that WRR-related modifications exist.
+          if ! grep -Eiq \
+            'weighted|wrr|round.?robin' \
+            "$GITHUB_WORKSPACE/wrr-change.patch"; then
+
+            echo 'ERROR: WRR changes were not found in source diff.' >&2
             exit 1
           fi
-          if ! grep -Eiq 'selection.{0,80}(stat|count)|(stat|count).{0,80}selection' wrr-change.patch; then
-            echo 'ERROR: native selection-statistics changes were not found in the source diff.' >&2
+
+          # Verify that selection-statistics modifications exist.
+          if ! grep -Eiq \
+            'selection.{0,80}(stat|count)|(stat|count).{0,80}selection' \
+            "$GITHUB_WORKSPACE/wrr-change.patch"; then
+
+            echo 'ERROR: selection statistics changes were not found.' >&2
             exit 1
           fi
+
           {
             echo 'wrr_patch_script=scripts/patch_weighted_balancer_with_stats.py'
-            echo "wrr_patch_commit=$(git -C patch-repo rev-parse HEAD)"
+
+            echo "wrr_patch_commit=$(git -C "$GITHUB_WORKSPACE/patch-repo" rev-parse HEAD)"
+
             echo 'wrr_diff_markers=verified'
             echo 'selection_stats_diff_markers=verified'
+
             echo 'changed_files:'
-            cat wrr-changed-files.txt
-          } > wrr-validation.txt
-          cat wrr-validation.txt
+            cat "$GITHUB_WORKSPACE/wrr-changed-files.txt"
+
+          } > "$GITHUB_WORKSPACE/wrr-validation.txt"
+
+          cat "$GITHUB_WORKSPACE/wrr-validation.txt"
+
+      # --------------------------------------------------
+      # 5. Apply AnyTLS implementation
+      # --------------------------------------------------
 
       - name: Add AnyTLS to WRR-patched Xray
         shell: bash
         run: |
           set -euo pipefail
+
+          echo "Applying AnyTLS patch..."
+
           test -f anytls-source/infra/conf/anytls.go
           test -f anytls-source/proxy/anytls/config.pb.go
+
           if [[ -e xray-core/proxy/anytls || -e xray-core/infra/conf/anytls.go ]]; then
-            echo 'ERROR: Xray already contains AnyTLS files; refusing to overwrite them.' >&2
+            echo 'ERROR: Xray already contains AnyTLS files.' >&2
             exit 1
           fi
 
-          # Only copy the files introduced for AnyTLS, not the fork's unrelated
-          # REALITY changes, go.mod changes, build scripts, or other patches.
-          cp -a anytls-source/proxy/anytls xray-core/proxy/anytls
-          cp anytls-source/infra/conf/anytls.go xray-core/infra/conf/anytls.go
+          # Copy only the required AnyTLS implementation.
+          cp -a \
+            anytls-source/proxy/anytls \
+            xray-core/proxy/anytls
 
+          cp \
+            anytls-source/infra/conf/anytls.go \
+            xray-core/infra/conf/anytls.go
+
+          # Register AnyTLS inbound and outbound configuration.
           python3 - <<'PY'
           from pathlib import Path
 
           config = Path('xray-core/infra/conf/xray.go')
+
           text = config.read_text(encoding='utf-8')
+
           edits = [
               (
                   'inboundConfigLoader = NewJSONConfigLoader(ConfigCreatorCache{',
@@ -156,28 +235,57 @@ jobs:
                   '\n\t\t"anytls": func() interface{} { return new(AnyTLSClientConfig) },',
               ),
           ]
+
           for anchor, addition in edits:
               if text.count(anchor) != 1:
-                  raise SystemExit(f'ERROR: Xray config registration anchor changed: {anchor}')
+                  raise SystemExit(
+                      f'ERROR: Xray config registration anchor changed: {anchor}'
+                  )
+
               text = text.replace(anchor, anchor + addition, 1)
+
           config.write_text(text, encoding='utf-8')
 
+          # Register AnyTLS implementation in distro imports.
           imports = Path('xray-core/main/distro/all/all.go')
+
           text = imports.read_text(encoding='utf-8')
+
           anchor = '_ "github.com/xtls/xray-core/proxy/blackhole"'
+
           if text.count(anchor) != 1:
-              raise SystemExit('ERROR: Xray distro import anchor changed')
-          text = text.replace(anchor,
-              '_ "github.com/xtls/xray-core/proxy/anytls"\n\t' + anchor, 1)
+              raise SystemExit(
+                  'ERROR: Xray distro import anchor changed'
+              )
+
+          text = text.replace(
+              anchor,
+              '_ "github.com/xtls/xray-core/proxy/anytls"\n\t' + anchor,
+              1
+          )
+
           imports.write_text(text, encoding='utf-8')
           PY
 
+          # Format and verify Go source changes.
           cd xray-core
-          gofmt -w infra/conf/xray.go infra/conf/anytls.go main/distro/all/all.go proxy/anytls/*.go
+
+          gofmt -w \
+            infra/conf/xray.go \
+            infra/conf/anytls.go \
+            main/distro/all/all.go \
+            proxy/anytls/*.go
+
           git add -N infra/conf/anytls.go proxy/anytls
+
           git diff --check
-          echo 'Changed tracked files:'
+
+          echo "AnyTLS source files applied."
           git diff --stat
+
+      # --------------------------------------------------
+      # 6. Setup Go
+      # --------------------------------------------------
 
       - name: Set up Go from official Xray go.mod
         uses: actions/setup-go@v5
@@ -186,14 +294,24 @@ jobs:
           cache: true
           cache-dependency-path: xray-core/go.sum
 
+      # --------------------------------------------------
+      # 7. Run Go tests
+      # --------------------------------------------------
+
       - name: Test AnyTLS and routing packages
         if: matrix.goos == 'linux' && matrix.goarch == 'amd64'
         working-directory: xray-core
         shell: bash
         run: |
           set -euo pipefail
+
           go mod download
+
           go test ./proxy/anytls ./app/router
+
+      # --------------------------------------------------
+      # 8. Build binaries
+      # --------------------------------------------------
 
       - name: Compile Xray with WRR + stats + AnyTLS
         working-directory: xray-core
@@ -205,23 +323,41 @@ jobs:
           XRAY_REF: ${{ inputs.xray_ref }}
         run: |
           set -euo pipefail
+
           mkdir -p dist
+
           binary="dist/xray-wrr-anytls-${{ matrix.suffix }}${{ matrix.ext }}"
-          go build -trimpath -buildvcs=false \
+
+          go build \
+            -trimpath \
+            -buildvcs=false \
             -ldflags='-s -w -buildid=' \
-            -o "$binary" ./main
+            -o "$binary" \
+            ./main
+
           sha256sum "$binary" > "$binary.sha256"
+
+          # Save source and patch revision information.
           {
             echo "upstream_repo=XTLS/Xray-core"
             echo "upstream_ref=$XRAY_REF"
             echo "upstream_commit=${{ steps.revisions.outputs.upstream }}"
+
             echo "anytls_source_repo=ynetlab/Xray-core"
             echo "anytls_source_commit=0721f9b543a6c20f503c1ac181eeb27d98d808f2"
+
             echo 'wrr_patch=patch-repo/scripts/patch_weighted_balancer_with_stats.py'
             echo 'selection_stats=source_diff_verified'
+
             echo "wrr_patch_commit=$(git -C ../patch-repo rev-parse HEAD)"
+
             cat ../wrr-validation.txt
+
           } > "dist/build-info-${{ matrix.suffix }}.txt"
+
+      # --------------------------------------------------
+      # 9. Smoke-test AnyTLS configuration
+      # --------------------------------------------------
 
       - name: Smoke-test AnyTLS outbound config (Linux AMD64)
         if: matrix.goos == 'linux' && matrix.goarch == 'amd64'
@@ -229,10 +365,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
           dist/xray-wrr-anytls-linux-amd64 version
+
           cat > /tmp/anytls-client-test.json <<'JSON'
           {
-            "log": {"loglevel": "warning"},
+            "log": {
+              "loglevel": "warning"
+            },
             "outbounds": [
               {
                 "protocol": "anytls",
@@ -244,13 +384,24 @@ jobs:
                 "streamSettings": {
                   "network": "tcp",
                   "security": "tls",
-                  "tlsSettings": {"serverName": "example.com"}
+                  "tlsSettings": {
+                    "serverName": "example.com"
+                  }
                 }
               }
             ]
           }
           JSON
-          dist/xray-wrr-anytls-linux-amd64 run -test -c /tmp/anytls-client-test.json
+
+          dist/xray-wrr-anytls-linux-amd64 \
+            run -test \
+            -c /tmp/anytls-client-test.json
+
+          echo "AnyTLS outbound configuration validation passed."
+
+      # --------------------------------------------------
+      # 10. Upload build artifacts
+      # --------------------------------------------------
 
       - name: Upload platform artifact
         uses: actions/upload-artifact@v4
