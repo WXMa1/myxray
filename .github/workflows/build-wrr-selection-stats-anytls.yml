@@ -1,0 +1,395 @@
+# Third, INDEPENDENT workflow: WRR + selection stats + AnyTLS.
+# This reuses the existing WRR workflow's SOURCE PATCH STEPS; it does not
+# modify or replace the standalone WRR or AnyTLS workflows.
+# PR: https://github.com/XTLS/Xray-core/pull/5907
+# AnyTLS source pinned to: 0721f9b543a6c20f503c1ac181eeb27d98d808f2
+name: Build Xray with WRR + Selection Stats + AnyTLS
+
+on:
+  workflow_dispatch:
+    inputs:
+      xray_ref:
+        description: 'Official Xray ref used by both patches; default main'
+        required: true
+        type: string
+        default: main
+      wrr_workflow:
+        description: 'Existing WRR + stats workflow path, relative to repo (auto = discover)'
+        required: true
+        type: string
+        default: auto
+
+permissions:
+  contents: read
+
+jobs:
+  build-combined:
+    name: Combined / ${{ matrix.goos }}-${{ matrix.goarch }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { goos: linux,   goarch: amd64, suffix: linux-amd64,   ext: '' }
+          - { goos: linux,   goarch: arm64, suffix: linux-arm64,   ext: '' }
+          - { goos: windows, goarch: amd64, suffix: windows-amd64, ext: '.exe' }
+          - { goos: darwin,  goarch: amd64, suffix: darwin-amd64,  ext: '' }
+          - { goos: darwin,  goarch: arm64, suffix: darwin-arm64,  ext: '' }
+
+    steps:
+      - name: Checkout your myxray repository (original WRR workflow)
+        uses: actions/checkout@v4
+        with:
+          path: custom
+          persist-credentials: false
+
+      - name: Checkout official Xray-core
+        uses: actions/checkout@v4
+        with:
+          repository: XTLS/Xray-core
+          ref: ${{ inputs.xray_ref }}
+          path: xray-core
+          persist-credentials: false
+
+      - name: Checkout pinned AnyTLS implementation
+        uses: actions/checkout@v4
+        with:
+          repository: ynetlab/Xray-core
+          ref: 0721f9b543a6c20f503c1ac181eeb27d98d808f2
+          path: anytls-source
+          persist-credentials: false
+
+      - name: Check source revisions
+        id: revisions
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected='0721f9b543a6c20f503c1ac181eeb27d98d808f2'
+          actual="$(git -C anytls-source rev-parse HEAD)"
+          if [[ "$actual" != "$expected" ]]; then
+            echo "ERROR: AnyTLS source revision differs from the pinned commit" >&2
+            exit 1
+          fi
+          upstream="$(git -C xray-core rev-parse HEAD)"
+          echo "upstream=$upstream" >> "$GITHUB_OUTPUT"
+          echo "upstream_short=${upstream:0:12}" >> "$GITHUB_OUTPUT"
+          echo "Xray upstream: $upstream"
+          echo "AnyTLS source:  $actual"
+
+      - name: Set up Python for WRR workflow patch extraction
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install parser for original WRR workflow
+        run: python -m pip install --disable-pip-version-check PyYAML==6.0.2
+
+      - name: Apply original WRR + selection stats source patches
+        shell: bash
+        env:
+          WRR_WORKFLOW: ${{ inputs.wrr_workflow }}
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import os
+          import re
+          import subprocess
+          import sys
+          import yaml
+
+          workspace = Path.cwd().resolve()
+          custom = workspace / 'custom'
+          core = workspace / 'xray-core'
+          wf_dir = custom / '.github' / 'workflows'
+          override = os.environ.get('WRR_WORKFLOW', 'auto').strip()
+
+          # The original WRR action may be self-contained and hold its patch code inline.
+          # Reuse those source-modifying steps, not its checkout/build/upload jobs.
+          if override.lower() != 'auto':
+              workflow = (custom / override).resolve()
+              if not workflow.is_relative_to(custom.resolve()):
+                  raise SystemExit('WRR workflow path must be inside this repository')
+              if not workflow.is_file():
+                  raise SystemExit(f'Original WRR workflow not found: {workflow}')
+          else:
+              ranked = []
+              for f in sorted(list(wf_dir.glob('*.yml')) + list(wf_dir.glob('*.yaml'))):
+                  if ('anytls' in f.name.lower()) or ('combined' in f.name.lower()):
+                      continue
+                  content = f.read_text(encoding='utf-8', errors='replace')
+                  lo = content.lower()
+                  weighted = bool(re.search(r'\bwrr\b|weighted.?round.?robin|weighted.?balanc', lo))
+                  stats = bool(re.search(r'selection.?stats|selection.?count|selector.?stat', lo))
+                  if not weighted:
+                      continue
+                  score = 10 * int(weighted) + 5 * int(stats)
+                  score += 2 * int('wrr' in f.name.lower())
+                  score += int('stats' in f.name.lower())
+                  ranked.append((score, f))
+              if not ranked:
+                  raise SystemExit('No WRR workflow found. Set wrr_workflow to the original workflow path. '
+                                   'This job refuses to produce an AnyTLS-only binary.')
+              ranked.sort(key=lambda row: (-row[0], str(row[1])))
+              if len(ranked) > 1 and ranked[0][0] == ranked[1][0]:
+                  raise SystemExit('Ambiguous WRR workflows: ' + ', '.join(str(f) for s, f in ranked
+                                   if s == ranked[0][0]) + '. Set wrr_workflow explicitly.')
+              workflow = ranked[0][1]
+
+          print('Original WRR + stats workflow:', workflow, flush=True)
+          doc = yaml.safe_load(workflow.read_text(encoding='utf-8'))
+          if not isinstance(doc, dict) or not isinstance(doc.get('jobs'), dict):
+              raise SystemExit('Original WRR workflow is not a valid jobs-based GitHub Actions YAML')
+
+          # Support common source-directory names used by inline patch scripts.
+          for alias in ('xray-core', 'xray', 'Xray-core'):
+              path = custom / alias
+              if not path.exists() and not path.is_symlink():
+                  path.symlink_to(core, target_is_directory=True)
+
+          subject = re.compile(r'wrr|weighted|round.?robin|selection.?stats|selection.?count|selector.?stat', re.I)
+          mutation = re.compile(r'write_text\s*\(|write_bytes\s*\(|\.replace\s*\(|sed\s+-i|perl\s+-[0-9a-z]*i|'
+                                r'git\s+apply|patch\s+-p|cat\s*>|>>|python[0-9.]*\s+[^\n]*patch[^\n]*\.py', re.I)
+          patch_name = re.compile(r'patch|inject|implement|modify|source|扩展|打补丁|修改|注入|源码|实现|添加', re.I)
+          unsafe = re.compile(r'\bgo\s+(?:build|install)\b|\bgit\s+(?:clone|reset|checkout|clean)\b|'
+                              r'gh\s+release|curl\s+[^\n]*\|\s*bash', re.I)
+          heredoc_start = re.compile(r"^\s*(?:python3?|python3\s+-u)\s+-\s+<<-?\s*['\"]?([A-Za-z_][A-Za-z_0-9]*)['\"]?\s*$")
+
+          # Some original actions put patching and building in one run block. If so,
+          # extract its modifying Python heredoc(s) without running the build commands.
+          def python_patch_blocks(script):
+              lines = script.splitlines()
+              found = []
+              n = 0
+              while n < len(lines):
+                  match = heredoc_start.match(lines[n])
+                  if not match:
+                      n += 1
+                      continue
+                  delim = match.group(1)
+                  begin = n
+                  n += 1
+                  while n < len(lines) and lines[n].strip() != delim:
+                      n += 1
+                  if n == len(lines):
+                      raise SystemExit('Unterminated Python heredoc in original WRR workflow')
+                  block = '\n'.join(lines[begin:n+1]) + '\n'
+                  if subject.search(block) and mutation.search(block):
+                      found.append(block)
+                  n += 1
+              return found
+
+          jobs = doc['jobs']
+          steps = []
+          for job_name, job in jobs.items():
+              if not isinstance(job, dict):
+                  continue
+              for i, step in enumerate(job.get('steps', [])):
+                  if not isinstance(step, dict) or not isinstance(step.get('run'), str):
+                      continue
+                  name = str(step.get('name') or f'{job_name}/step-{i+1}')
+                  script = step['run']
+                  if not (subject.search(name + '\n' + script) and mutation.search(script)):
+                      continue
+                  # Avoid executing a WRR smoke-test/config-writing step before compilation.
+                  if re.search(r'test|smoke|verify|validat|检查|验证|测试', name, re.I) and not patch_name.search(name):
+                      continue
+                  if not (patch_name.search(name) or re.search(r'\.(?:go|proto)\b|app/router|infra/conf|proxy/', script, re.I)):
+                      continue
+                  if unsafe.search(script):
+                      blocks = python_patch_blocks(script)
+                      if not blocks:
+                          raise SystemExit(f'Potential WRR patch mixed with build/clone in {name!r}; cannot safely extract. '
+                                           'Split the original patch into its own run step or script.')
+                      for idx, block in enumerate(blocks):
+                          steps.append((name + f' (Python patch {idx+1})', block, step))
+                  else:
+                      steps.append((name, script, step))
+
+          if not steps:
+              raise SystemExit('Found WRR workflow but no safely executable source-modification steps. '
+                               'Original workflow must have a distinct patch step.')
+
+          # Do not silently build AnyTLS without WRR: require WRR and selection stats
+          # evidence in the resulting source diff, plus a real Go compilation later.
+          completed = []
+          for name, script, step in steps:
+              script = re.sub(r'\$\{\{\s*github\.workspace\s*\}\}', str(custom), script)
+              if ('$' + '{{') in script:
+                  raise SystemExit(f'Unresolved GitHub expression in WRR patch step {name!r}. '
+                                   'This action cannot safely replay that step verbatim.')
+              directory = step.get('working-directory') or '.'
+              if not isinstance(directory, str) or ('$' + '{{') in directory:
+                  raise SystemExit(f'Unsupported working-directory for step {name!r}')
+              cwd = (custom / directory).resolve()
+              if not cwd.is_relative_to(workspace):
+                  raise SystemExit(f'Patch working directory escapes workspace: {directory}')
+              if not cwd.is_dir():
+                  raise SystemExit(f'Patch working directory does not exist: {directory}')
+              env = os.environ.copy()
+              env.update({'XRAY_SRC': str(core), 'XRAY_DIR': str(core),
+                          'XRAY_SOURCE_DIR': str(core), 'GITHUB_WORKSPACE': str(custom)})
+              for key, val in (step.get('env') or {}).items():
+                  if not isinstance(val, (str, int, float, bool)) or ('$' + '{{') in str(val):
+                      raise SystemExit(f'Unsupported expression in env of WRR patch step {name!r}: {key}')
+                  env[str(key)] = str(val)
+              print('Applying original WRR step:', name, flush=True)
+              subprocess.run(['bash', '-euo', 'pipefail', '-c', script], cwd=cwd, env=env, check=True)
+              completed.append(name)
+
+          subprocess.run(['git', '-C', str(core), 'add', '-N', '.'], check=True)
+          diff = subprocess.check_output(['git', '-C', str(core), 'diff', '--no-ext-diff', '--unified=1'], text=True)
+          changed = subprocess.check_output(['git', '-C', str(core), 'diff', '--name-only'], text=True).strip()
+          if not changed:
+              raise SystemExit('Original WRR steps ran but did not modify Xray source. Failing closed.')
+          if not re.search(r'weighted|\bwrr\b|round.?robin', diff, re.I):
+              raise SystemExit('No WRR implementation markers found in source diff; refusing AnyTLS-only build.')
+          if not re.search(r'selection.?stats|selection.?count|selector.?stat', diff, re.I):
+              raise SystemExit('No selection stats implementation markers found in source diff; refusing build.')
+
+          (workspace / 'wrr-validation.txt').write_text(
+              'original_workflow=' + str(workflow.relative_to(custom)) + '\n'
+              + 'applied_patch_steps=' + ' | '.join(completed) + '\n'
+              + 'changed_files=\n' + changed + '\n'
+              + 'wrr_diff_markers=found\nselection_stats_diff_markers=found\n',
+              encoding='utf-8')
+          print('WRR + selection stats source-diff checks passed.\n' + changed, flush=True)
+          PY
+
+      - name: Add AnyTLS after WRR
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f anytls-source/infra/conf/anytls.go
+          test -f anytls-source/proxy/anytls/config.pb.go
+          if [[ -e xray-core/proxy/anytls || -e xray-core/infra/conf/anytls.go ]]; then
+            echo 'ERROR: Xray already contains AnyTLS files; refusing to overwrite them.' >&2
+            exit 1
+          fi
+
+          # Only copy the files introduced for AnyTLS, not the fork's unrelated
+          # REALITY changes, go.mod changes, build scripts, or other patches.
+          cp -a anytls-source/proxy/anytls xray-core/proxy/anytls
+          cp anytls-source/infra/conf/anytls.go xray-core/infra/conf/anytls.go
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          config = Path('xray-core/infra/conf/xray.go')
+          text = config.read_text(encoding='utf-8')
+          edits = [
+              (
+                  'inboundConfigLoader = NewJSONConfigLoader(ConfigCreatorCache{',
+                  '\n\t\t"anytls": func() interface{} { return new(AnyTLSServerConfig) },',
+              ),
+              (
+                  'outboundConfigLoader = NewJSONConfigLoader(ConfigCreatorCache{',
+                  '\n\t\t"anytls": func() interface{} { return new(AnyTLSClientConfig) },',
+              ),
+          ]
+          for anchor, addition in edits:
+              if text.count(anchor) != 1:
+                  raise SystemExit(f'ERROR: Xray config registration anchor changed: {anchor}')
+              text = text.replace(anchor, anchor + addition, 1)
+          config.write_text(text, encoding='utf-8')
+
+          imports = Path('xray-core/main/distro/all/all.go')
+          text = imports.read_text(encoding='utf-8')
+          anchor = '_ "github.com/xtls/xray-core/proxy/blackhole"'
+          if text.count(anchor) != 1:
+              raise SystemExit('ERROR: Xray distro import anchor changed')
+          text = text.replace(anchor,
+              '_ "github.com/xtls/xray-core/proxy/anytls"\n\t' + anchor, 1)
+          imports.write_text(text, encoding='utf-8')
+          PY
+
+          cd xray-core
+          gofmt -w infra/conf/xray.go infra/conf/anytls.go main/distro/all/all.go proxy/anytls/*.go
+          git add -N infra/conf/anytls.go proxy/anytls
+          git diff --check
+          echo 'Changed tracked files:'
+          git diff --stat
+
+      - name: Set up Go from official Xray go.mod
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: xray-core/go.mod
+          cache: true
+          cache-dependency-path: xray-core/go.sum
+
+      - name: Test AnyTLS and routing packages
+        if: matrix.goos == 'linux' && matrix.goarch == 'amd64'
+        working-directory: xray-core
+        shell: bash
+        run: |
+          set -euo pipefail
+          go mod download
+          go test ./proxy/anytls ./app/router
+
+      - name: Compile Xray with WRR + stats + AnyTLS
+        working-directory: xray-core
+        shell: bash
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: '0'
+          XRAY_REF: ${{ inputs.xray_ref }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          binary="dist/xray-wrr-anytls-${{ matrix.suffix }}${{ matrix.ext }}"
+          go build -trimpath -buildvcs=false \
+            -ldflags='-s -w -buildid=' \
+            -o "$binary" ./main
+          sha256sum "$binary" > "$binary.sha256"
+          {
+            echo "upstream_repo=XTLS/Xray-core"
+            echo "upstream_ref=$XRAY_REF"
+            echo "upstream_commit=${{ steps.revisions.outputs.upstream }}"
+            echo "anytls_source_repo=ynetlab/Xray-core"
+            echo "anytls_source_commit=0721f9b543a6c20f503c1ac181eeb27d98d808f2"
+            echo 'wrr_patch=original_workflow_reused'
+            echo 'selection_stats=source_diff_verified'
+            cat ../wrr-validation.txt
+          } > "dist/build-info-${{ matrix.suffix }}.txt"
+
+      - name: Smoke-test AnyTLS outbound config (Linux AMD64)
+        if: matrix.goos == 'linux' && matrix.goarch == 'amd64'
+        working-directory: xray-core
+        shell: bash
+        run: |
+          set -euo pipefail
+          dist/xray-wrr-anytls-linux-amd64 version
+          cat > /tmp/anytls-client-test.json <<'JSON'
+          {
+            "log": {"loglevel": "warning"},
+            "outbounds": [
+              {
+                "protocol": "anytls",
+                "settings": {
+                  "address": "example.com",
+                  "port": 443,
+                  "password": "ci-test-only-password"
+                },
+                "streamSettings": {
+                  "network": "tcp",
+                  "security": "tls",
+                  "tlsSettings": {"serverName": "example.com"}
+                }
+              }
+            ]
+          }
+          JSON
+          dist/xray-wrr-anytls-linux-amd64 run -test -c /tmp/anytls-client-test.json
+
+      - name: Upload platform artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: xray-wrr-anytls-${{ matrix.suffix }}-${{ steps.revisions.outputs.upstream_short }}
+          path: |
+            wrr-validation.txt
+            xray-core/dist/xray-wrr-anytls-${{ matrix.suffix }}${{ matrix.ext }}
+            xray-core/dist/xray-wrr-anytls-${{ matrix.suffix }}${{ matrix.ext }}.sha256
+            xray-core/dist/build-info-${{ matrix.suffix }}.txt
+          if-no-files-found: error
+          retention-days: 14
