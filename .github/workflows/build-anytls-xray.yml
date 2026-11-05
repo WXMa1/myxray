@@ -1,0 +1,202 @@
+# Standalone AnyTLS build for WXMa1/myxray.
+# Does NOT apply scripts/patch_weighted_balancer.py or any WRR changes.
+# AnyTLS implementation source (fixed revision):
+# https://github.com/ynetlab/Xray-core/commit/0721f9b543a6c20f503c1ac181eeb27d98d808f2
+# Original implementation: https://github.com/XTLS/Xray-core/pull/5907
+name: Build Xray with AnyTLS (standalone)
+
+on:
+  workflow_dispatch:
+    inputs:
+      xray_ref:
+        description: 'Official XTLS/Xray-core branch, tag, or commit (newer refs may need patch updates)'
+        required: true
+        type: string
+        default: main
+
+permissions:
+  contents: read
+
+jobs:
+  build-anytls:
+    name: AnyTLS / ${{ matrix.goos }}-${{ matrix.goarch }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { goos: linux,   goarch: amd64, suffix: linux-amd64,   ext: '' }
+          - { goos: linux,   goarch: arm64, suffix: linux-arm64,   ext: '' }
+          - { goos: windows, goarch: amd64, suffix: windows-amd64, ext: '.exe' }
+          - { goos: darwin,  goarch: amd64, suffix: darwin-amd64,  ext: '' }
+          - { goos: darwin,  goarch: arm64, suffix: darwin-arm64,  ext: '' }
+
+    steps:
+      - name: Checkout official Xray-core
+        uses: actions/checkout@v4
+        with:
+          repository: XTLS/Xray-core
+          ref: ${{ inputs.xray_ref }}
+          path: xray-core
+          persist-credentials: false
+
+      - name: Checkout pinned AnyTLS implementation
+        uses: actions/checkout@v4
+        with:
+          repository: ynetlab/Xray-core
+          ref: 0721f9b543a6c20f503c1ac181eeb27d98d808f2
+          path: anytls-source
+          persist-credentials: false
+
+      - name: Check source revisions
+        id: revisions
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected='0721f9b543a6c20f503c1ac181eeb27d98d808f2'
+          actual="$(git -C anytls-source rev-parse HEAD)"
+          if [[ "$actual" != "$expected" ]]; then
+            echo "ERROR: AnyTLS source revision differs from the pinned commit" >&2
+            exit 1
+          fi
+          upstream="$(git -C xray-core rev-parse HEAD)"
+          echo "upstream=$upstream" >> "$GITHUB_OUTPUT"
+          echo "upstream_short=${upstream:0:12}" >> "$GITHUB_OUTPUT"
+          echo "Xray upstream: $upstream"
+          echo "AnyTLS source:  $actual"
+
+      - name: Add AnyTLS only (no WRR)
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f anytls-source/infra/conf/anytls.go
+          test -f anytls-source/proxy/anytls/config.pb.go
+          if [[ -e xray-core/proxy/anytls || -e xray-core/infra/conf/anytls.go ]]; then
+            echo 'ERROR: Xray already contains AnyTLS files; refusing to overwrite them.' >&2
+            exit 1
+          fi
+
+          # Only copy the files introduced for AnyTLS, not the fork's unrelated
+          # REALITY changes, go.mod changes, build scripts, or other patches.
+          cp -a anytls-source/proxy/anytls xray-core/proxy/anytls
+          cp anytls-source/infra/conf/anytls.go xray-core/infra/conf/anytls.go
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          config = Path('xray-core/infra/conf/xray.go')
+          text = config.read_text(encoding='utf-8')
+          edits = [
+              (
+                  'inboundConfigLoader = NewJSONConfigLoader(ConfigCreatorCache{',
+                  '\n\t\t"anytls": func() interface{} { return new(AnyTLSServerConfig) },',
+              ),
+              (
+                  'outboundConfigLoader = NewJSONConfigLoader(ConfigCreatorCache{',
+                  '\n\t\t"anytls": func() interface{} { return new(AnyTLSClientConfig) },',
+              ),
+          ]
+          for anchor, addition in edits:
+              if text.count(anchor) != 1:
+                  raise SystemExit(f'ERROR: Xray config registration anchor changed: {anchor}')
+              text = text.replace(anchor, anchor + addition, 1)
+          config.write_text(text, encoding='utf-8')
+
+          imports = Path('xray-core/main/distro/all/all.go')
+          text = imports.read_text(encoding='utf-8')
+          anchor = '_ "github.com/xtls/xray-core/proxy/blackhole"'
+          if text.count(anchor) != 1:
+              raise SystemExit('ERROR: Xray distro import anchor changed')
+          text = text.replace(anchor,
+              '_ "github.com/xtls/xray-core/proxy/anytls"\n\t' + anchor, 1)
+          imports.write_text(text, encoding='utf-8')
+          PY
+
+          cd xray-core
+          gofmt -w infra/conf/xray.go infra/conf/anytls.go main/distro/all/all.go proxy/anytls/*.go
+          git add -N infra/conf/anytls.go proxy/anytls
+          git diff --check
+          echo 'Changed tracked files:'
+          git diff --stat
+
+      - name: Set up Go from official Xray go.mod
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: xray-core/go.mod
+          cache: true
+          cache-dependency-path: xray-core/go.sum
+
+      - name: Test AnyTLS package
+        if: matrix.goos == 'linux' && matrix.goarch == 'amd64'
+        working-directory: xray-core
+        shell: bash
+        run: |
+          set -euo pipefail
+          go mod download
+          go test ./proxy/anytls
+
+      - name: Compile Xray with AnyTLS
+        working-directory: xray-core
+        shell: bash
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: '0'
+          XRAY_REF: ${{ inputs.xray_ref }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          binary="dist/xray-anytls-${{ matrix.suffix }}${{ matrix.ext }}"
+          go build -trimpath -buildvcs=false \
+            -ldflags='-s -w -buildid=' \
+            -o "$binary" ./main
+          sha256sum "$binary" > "$binary.sha256"
+          {
+            echo "upstream_repo=XTLS/Xray-core"
+            echo "upstream_ref=$XRAY_REF"
+            echo "upstream_commit=${{ steps.revisions.outputs.upstream }}"
+            echo "anytls_source_repo=ynetlab/Xray-core"
+            echo "anytls_source_commit=0721f9b543a6c20f503c1ac181eeb27d98d808f2"
+            echo 'wrr_patch=not_applied'
+          } > "dist/build-info-${{ matrix.suffix }}.txt"
+
+      - name: Smoke-test AnyTLS outbound config (Linux AMD64)
+        if: matrix.goos == 'linux' && matrix.goarch == 'amd64'
+        working-directory: xray-core
+        shell: bash
+        run: |
+          set -euo pipefail
+          dist/xray-anytls-linux-amd64 version
+          cat > /tmp/anytls-client-test.json <<'JSON'
+          {
+            "log": {"loglevel": "warning"},
+            "outbounds": [
+              {
+                "protocol": "anytls",
+                "settings": {
+                  "address": "example.com",
+                  "port": 443,
+                  "password": "ci-test-only-password"
+                },
+                "streamSettings": {
+                  "network": "tcp",
+                  "security": "tls",
+                  "tlsSettings": {"serverName": "example.com"}
+                }
+              }
+            ]
+          }
+          JSON
+          dist/xray-anytls-linux-amd64 run -test -c /tmp/anytls-client-test.json
+
+      - name: Upload platform artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: xray-anytls-${{ matrix.suffix }}-${{ steps.revisions.outputs.upstream_short }}
+          path: |
+            xray-core/dist/xray-anytls-${{ matrix.suffix }}${{ matrix.ext }}
+            xray-core/dist/xray-anytls-${{ matrix.suffix }}${{ matrix.ext }}.sha256
+            xray-core/dist/build-info-${{ matrix.suffix }}.txt
+          if-no-files-found: error
+          retention-days: 14
