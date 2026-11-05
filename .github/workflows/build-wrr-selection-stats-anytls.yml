@@ -1,8 +1,8 @@
 
+# ============================================================
 # Xray-core + WRR + Selection Stats + AnyTLS
-# Standalone combined build workflow.
-# WRR patch is loaded from the current myxray repository.
-# AnyTLS source is pinned to a known commit.
+# V5 - Fix GeoData missing during Linux AMD64 routing tests
+# ============================================================
 
 name: Build Xray with WRR + Selection Stats + AnyTLS
 
@@ -10,7 +10,7 @@ on:
   workflow_dispatch:
     inputs:
       xray_ref:
-        description: 'XTLS/Xray-core ref (must also be compatible with WRR script)'
+        description: 'XTLS/Xray-core ref'
         required: true
         type: string
         default: main
@@ -35,11 +35,12 @@ jobs:
           - { goos: darwin,  goarch: arm64, suffix: darwin-arm64,  ext: '' }
 
     steps:
-      # --------------------------------------------------
-      # 1. Checkout repositories
-      # --------------------------------------------------
 
-      - name: Checkout your original WRR patch repository
+      # ======================================================
+      # 1. Checkout repositories
+      # ======================================================
+
+      - name: Checkout original WRR patch repository
         uses: actions/checkout@v4
         with:
           path: patch-repo
@@ -61,9 +62,9 @@ jobs:
           path: anytls-source
           persist-credentials: false
 
-      # --------------------------------------------------
-      # 2. Verify source revisions
-      # --------------------------------------------------
+      # ======================================================
+      # 2. Verify revisions
+      # ======================================================
 
       - name: Check source revisions
         id: revisions
@@ -75,7 +76,7 @@ jobs:
           actual="$(git -C anytls-source rev-parse HEAD)"
 
           if [[ "$actual" != "$expected" ]]; then
-            echo 'ERROR: AnyTLS source revision differs from the pinned commit.' >&2
+            echo "ERROR: AnyTLS commit mismatch"
             exit 1
           fi
 
@@ -86,13 +87,13 @@ jobs:
 
           echo "Xray upstream: $upstream"
           echo "WRR patch repo: $(git -C patch-repo rev-parse HEAD)"
-          echo "AnyTLS source: $actual"
+          echo "AnyTLS commit: $actual"
 
-      # --------------------------------------------------
-      # 3. Verify WRR patch
-      # --------------------------------------------------
+      # ======================================================
+      # 3. Verify WRR patch script
+      # ======================================================
 
-      - name: Verify original WRR patch script is present
+      - name: Verify original WRR patch script
         shell: bash
         run: |
           set -euo pipefail
@@ -100,26 +101,18 @@ jobs:
           script="$GITHUB_WORKSPACE/patch-repo/scripts/patch_weighted_balancer_with_stats.py"
 
           if [[ ! -f "$script" ]]; then
-            echo "ERROR: missing WRR patch script: $script" >&2
-            echo 'Files in checked-out repository:' >&2
-
-            find patch-repo -maxdepth 3 -type f | head -60 >&2
-
+            echo "ERROR: WRR patch script missing: $script"
+            find patch-repo -maxdepth 3 -type f | head -60
             exit 1
           fi
 
           python3 -m py_compile "$script"
 
-          echo "WRR script found: $script"
+          echo "WRR patch script found."
 
-      # --------------------------------------------------
+      # ======================================================
       # 4. Apply WRR + Selection Stats
-      #
-      # FIX V4:
-      # The original patch script must execute from the
-      # Xray-core source root, because it reads go.mod
-      # and other source files using relative paths.
-      # --------------------------------------------------
+      # ======================================================
 
       - name: Apply original WRR + native selection-counter patch
         shell: bash
@@ -128,7 +121,7 @@ jobs:
 
           echo "Applying WRR + Selection Stats patch..."
 
-          # Run the patch INSIDE the Xray-core source root.
+          # Must run inside the Xray-core source root.
           (
             cd "$GITHUB_WORKSPACE/xray-core"
 
@@ -139,7 +132,6 @@ jobs:
 
           echo "WRR patch execution completed."
 
-          # Detect newly created and modified source files.
           git -C xray-core add -N .
           git -C xray-core diff --check
 
@@ -152,46 +144,46 @@ jobs:
             > "$GITHUB_WORKSPACE/wrr-changed-files.txt"
 
           if [[ ! -s "$GITHUB_WORKSPACE/wrr-changed-files.txt" ]]; then
-            echo 'ERROR: WRR patch produced no changes to Xray source.' >&2
+            echo "ERROR: WRR patch produced no changes."
             exit 1
           fi
 
-          # Verify that WRR-related modifications exist.
+          # Verify WRR markers.
           if ! grep -Eiq \
             'weighted|wrr|round.?robin' \
             "$GITHUB_WORKSPACE/wrr-change.patch"; then
 
-            echo 'ERROR: WRR changes were not found in source diff.' >&2
+            echo "ERROR: WRR changes not detected."
             exit 1
           fi
 
-          # Verify that selection-statistics modifications exist.
+          # Verify Selection Stats markers.
           if ! grep -Eiq \
             'selection.{0,80}(stat|count)|(stat|count).{0,80}selection' \
             "$GITHUB_WORKSPACE/wrr-change.patch"; then
 
-            echo 'ERROR: selection statistics changes were not found.' >&2
+            echo "ERROR: Selection Stats changes not detected."
             exit 1
           fi
 
           {
-            echo 'wrr_patch_script=scripts/patch_weighted_balancer_with_stats.py'
+            echo "wrr_patch_script=scripts/patch_weighted_balancer_with_stats.py"
 
             echo "wrr_patch_commit=$(git -C "$GITHUB_WORKSPACE/patch-repo" rev-parse HEAD)"
 
-            echo 'wrr_diff_markers=verified'
-            echo 'selection_stats_diff_markers=verified'
+            echo "wrr_diff_markers=verified"
+            echo "selection_stats_diff_markers=verified"
 
-            echo 'changed_files:'
+            echo "changed_files:"
             cat "$GITHUB_WORKSPACE/wrr-changed-files.txt"
 
           } > "$GITHUB_WORKSPACE/wrr-validation.txt"
 
           cat "$GITHUB_WORKSPACE/wrr-validation.txt"
 
-      # --------------------------------------------------
+      # ======================================================
       # 5. Apply AnyTLS implementation
-      # --------------------------------------------------
+      # ======================================================
 
       - name: Add AnyTLS to WRR-patched Xray
         shell: bash
@@ -204,11 +196,10 @@ jobs:
           test -f anytls-source/proxy/anytls/config.pb.go
 
           if [[ -e xray-core/proxy/anytls || -e xray-core/infra/conf/anytls.go ]]; then
-            echo 'ERROR: Xray already contains AnyTLS files.' >&2
+            echo "ERROR: Xray already contains AnyTLS."
             exit 1
           fi
 
-          # Copy only the required AnyTLS implementation.
           cp -a \
             anytls-source/proxy/anytls \
             xray-core/proxy/anytls
@@ -217,10 +208,10 @@ jobs:
             anytls-source/infra/conf/anytls.go \
             xray-core/infra/conf/anytls.go
 
-          # Register AnyTLS inbound and outbound configuration.
           python3 - <<'PY'
           from pathlib import Path
 
+          # Register AnyTLS inbound and outbound.
           config = Path('xray-core/infra/conf/xray.go')
 
           text = config.read_text(encoding='utf-8')
@@ -239,14 +230,14 @@ jobs:
           for anchor, addition in edits:
               if text.count(anchor) != 1:
                   raise SystemExit(
-                      f'ERROR: Xray config registration anchor changed: {anchor}'
+                      f'ERROR: Xray registration anchor changed: {anchor}'
                   )
 
               text = text.replace(anchor, anchor + addition, 1)
 
           config.write_text(text, encoding='utf-8')
 
-          # Register AnyTLS implementation in distro imports.
+          # Register the AnyTLS runtime implementation.
           imports = Path('xray-core/main/distro/all/all.go')
 
           text = imports.read_text(encoding='utf-8')
@@ -267,7 +258,6 @@ jobs:
           imports.write_text(text, encoding='utf-8')
           PY
 
-          # Format and verify Go source changes.
           cd xray-core
 
           gofmt -w \
@@ -283,37 +273,109 @@ jobs:
           echo "AnyTLS source files applied."
           git diff --stat
 
-      # --------------------------------------------------
+      # ======================================================
       # 6. Setup Go
-      # --------------------------------------------------
+      # ======================================================
 
-      - name: Set up Go from official Xray go.mod
+      - name: Set up Go from Xray go.mod
         uses: actions/setup-go@v5
         with:
           go-version-file: xray-core/go.mod
           cache: true
           cache-dependency-path: xray-core/go.sum
 
-      # --------------------------------------------------
-      # 7. Run Go tests
-      # --------------------------------------------------
+      # ======================================================
+      # 7. Download GeoData and run Go tests
+      #
+      # V5 FIX:
+      # Xray routing tests require resources/geosite.dat.
+      # Download the official GeoData and verify SHA256.
+      #
+      # Tests run on Linux AMD64 only.
+      # ======================================================
 
-      - name: Test AnyTLS and routing packages
+      - name: Download GeoData and test AnyTLS + WRR + routing
         if: matrix.goos == 'linux' && matrix.goarch == 'amd64'
         working-directory: xray-core
         shell: bash
         run: |
           set -euo pipefail
 
+          echo "========================================"
+          echo "Downloading official Xray GeoData"
+          echo "========================================"
+
+          mkdir -p resources
+
+          BASE_URL="https://github.com/XTLS/Xray-rules-dat/releases/latest/download"
+
+          # Download GeoSite standard database.
+          curl -fL --retry 3 \
+            "$BASE_URL/geosite.dat" \
+            -o resources/geosite.dat
+
+          curl -fL --retry 3 \
+            "$BASE_URL/geosite.dat.sha256sum" \
+            -o resources/geosite.dat.sha256sum
+
+          # Download GeoIP Lite database.
+          curl -fL --retry 3 \
+            "$BASE_URL/geoip-lite.dat" \
+            -o resources/geoip-lite.dat
+
+          curl -fL --retry 3 \
+            "$BASE_URL/geoip-lite.dat.sha256sum" \
+            -o resources/geoip-lite.dat.sha256sum
+
+          echo "========================================"
+          echo "Verifying GeoData SHA256"
+          echo "========================================"
+
+          (
+            cd resources
+
+            # Verify original filenames first.
+            sha256sum -c geosite.dat.sha256sum
+            sha256sum -c geoip-lite.dat.sha256sum
+
+            # Rename GeoIP Lite to the filename Xray expects.
+            mv geoip-lite.dat geoip.dat
+          )
+
+          test -s resources/geosite.dat
+          test -s resources/geoip.dat
+
+          echo "GeoData download and verification successful."
+
+          ls -lh resources/geosite.dat resources/geoip.dat
+
+          echo "========================================"
+          echo "Downloading Go dependencies"
+          echo "========================================"
+
           go mod download
 
-          go test ./proxy/anytls ./app/router
+          echo "========================================"
+          echo "Testing AnyTLS package"
+          echo "========================================"
 
-      # --------------------------------------------------
+          go test ./proxy/anytls -count=1
+
+          echo "========================================"
+          echo "Testing WRR + Selection Stats + routing"
+          echo "========================================"
+
+          go test ./app/router -count=1
+
+          echo "========================================"
+          echo "All Go tests passed"
+          echo "========================================"
+
+      # ======================================================
       # 8. Build binaries
-      # --------------------------------------------------
+      # ======================================================
 
-      - name: Compile Xray with WRR + stats + AnyTLS
+      - name: Compile Xray with WRR + Stats + AnyTLS
         working-directory: xray-core
         shell: bash
         env:
@@ -323,6 +385,8 @@ jobs:
           XRAY_REF: ${{ inputs.xray_ref }}
         run: |
           set -euo pipefail
+
+          echo "Building for $GOOS/$GOARCH"
 
           mkdir -p dist
 
@@ -337,7 +401,7 @@ jobs:
 
           sha256sum "$binary" > "$binary.sha256"
 
-          # Save source and patch revision information.
+          # Record source revision information.
           {
             echo "upstream_repo=XTLS/Xray-core"
             echo "upstream_ref=$XRAY_REF"
@@ -346,8 +410,8 @@ jobs:
             echo "anytls_source_repo=ynetlab/Xray-core"
             echo "anytls_source_commit=0721f9b543a6c20f503c1ac181eeb27d98d808f2"
 
-            echo 'wrr_patch=patch-repo/scripts/patch_weighted_balancer_with_stats.py'
-            echo 'selection_stats=source_diff_verified'
+            echo "wrr_patch=patch-repo/scripts/patch_weighted_balancer_with_stats.py"
+            echo "selection_stats=source_diff_verified"
 
             echo "wrr_patch_commit=$(git -C ../patch-repo rev-parse HEAD)"
 
@@ -355,18 +419,24 @@ jobs:
 
           } > "dist/build-info-${{ matrix.suffix }}.txt"
 
-      # --------------------------------------------------
-      # 9. Smoke-test AnyTLS configuration
-      # --------------------------------------------------
+          echo "Build completed: $binary"
 
-      - name: Smoke-test AnyTLS outbound config (Linux AMD64)
+      # ======================================================
+      # 9. Smoke-test AnyTLS configuration
+      # ======================================================
+
+      - name: Smoke-test AnyTLS outbound config
         if: matrix.goos == 'linux' && matrix.goarch == 'amd64'
         working-directory: xray-core
         shell: bash
         run: |
           set -euo pipefail
 
+          echo "Checking compiled Xray version..."
+
           dist/xray-wrr-anytls-linux-amd64 version
+
+          echo "Creating AnyTLS test configuration..."
 
           cat > /tmp/anytls-client-test.json <<'JSON'
           {
@@ -399,9 +469,9 @@ jobs:
 
           echo "AnyTLS outbound configuration validation passed."
 
-      # --------------------------------------------------
-      # 10. Upload build artifacts
-      # --------------------------------------------------
+      # ======================================================
+      # 10. Upload artifacts
+      # ======================================================
 
       - name: Upload platform artifact
         uses: actions/upload-artifact@v4
