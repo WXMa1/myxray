@@ -1,0 +1,56 @@
+name: WRB - Collect offline gRPC dependencies
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout exact Xray upstream commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir xray-core
+          git -C xray-core init
+          git -C xray-core remote add origin https://github.com/XTLS/Xray-core.git
+          git -C xray-core fetch --depth=1 origin 701af60772cda123492f86e383e1fdba066614a9
+          git -C xray-core checkout --detach FETCH_HEAD
+          test "$(git -C xray-core rev-parse HEAD)" = "701af60772cda123492f86e383e1fdba066614a9"
+      - name: Use Go version required by pinned Xray
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: xray-core/go.mod
+          cache: false
+      - name: Download, verify and vendor only needed API dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p offline
+          cd offline
+          go mod init wrb-grpc-offline
+          cat > bootstrap.go <<'GO'
+          package offline
+          import (
+            _ "github.com/xtls/xray-core/app/stats/command"
+            _ "github.com/xtls/xray-core/app/router/command"
+            _ "google.golang.org/grpc"
+            _ "google.golang.org/protobuf/proto"
+          )
+          GO
+          go get github.com/xtls/xray-core@701af60772cda123492f86e383e1fdba066614a9
+          go mod tidy
+          go test ./...
+          go list -m all > module-versions.txt
+          go mod vendor
+          printf '%s\n' 701af60772cda123492f86e383e1fdba066614a9 > upstream-commit.txt
+          zip -qr wrb-grpc-offline-deps.zip bootstrap.go go.mod go.sum module-versions.txt upstream-commit.txt vendor
+          unzip -t wrb-grpc-offline-deps.zip | tail -n 1
+          sha256sum wrb-grpc-offline-deps.zip
+      - name: Upload ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: wrb-grpc-offline-deps
+          path: offline/wrb-grpc-offline-deps.zip
+          retention-days: 7
+          compression-level: 0
