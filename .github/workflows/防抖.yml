@@ -655,6 +655,47 @@ jobs:
           git diff --stat
 
       # ======================================================
+      # 5b. Fix upstream unreachable legacy Reverse code
+      # This is present in the pinned Xray source and makes
+      # 'go vet ./infra/conf' fail even though builds succeed.
+      # Keep the original rejection behavior unchanged.
+      # ======================================================
+
+      - name: Fix upstream legacy Reverse unreachable code (go vet)
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PYFIX'
+          from pathlib import Path
+
+          path = Path('xray-core/infra/conf/xray.go')
+          source = path.read_text(encoding='utf-8')
+          original = (
+              '\tif c.Reverse != nil {\n'
+              '\t\treturn nil, errors.PrintRemovedFeatureError(`"legacy reverse"`, `"VLESS Reverse Proxy"`)\n'
+              '\t\tr, err := c.Reverse.Build()\n'
+              '\t\tif err != nil {\n'
+              '\t\t\treturn nil, errors.New("failed to build reverse configuration").Base(err)\n'
+              '\t\t}\n'
+              '\t\tconfig.App = append(config.App, serial.ToTypedMessage(r))\n'
+              '\t}\n'
+          )
+          corrected = (
+              '\tif c.Reverse != nil {\n'
+              '\t\treturn nil, errors.PrintRemovedFeatureError(`"legacy reverse"`, `"VLESS Reverse Proxy"`)\n'
+              '\t}\n'
+          )
+          if source.count(original) == 1:
+              path.write_text(source.replace(original, corrected, 1), encoding='utf-8')
+              print('Removed unreachable code after legacy Reverse rejection.')
+          elif source.count(corrected) == 1 and 'r, err := c.Reverse.Build()' not in source:
+              print('Already fixed by upstream; no change required.')
+          else:
+              raise SystemExit('ERROR: unexpected Xray Reverse block; refuse unsafe replacement')
+          PYFIX
+          ( cd xray-core && gofmt -w infra/conf/xray.go && git diff --check )
+
+      # ======================================================
       # 6. Setup Go
       # ======================================================
 
