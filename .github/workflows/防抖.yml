@@ -1,0 +1,880 @@
+
+# ============================================================
+# Xray-core + WRR + Selection Stats + AnyTLS
+# R5.1.7 - all 5 existing platforms; inline health fixes; preserve V5 GeoData fix
+# ============================================================
+
+name: Build Xray WRR + Stats + AnyTLS + R5.1.7 Health (all platforms)
+
+on:
+  workflow_dispatch:
+    inputs:
+      xray_ref:
+        description: 'XTLS/Xray-core ref'
+        required: true
+        type: string
+        default: a52db8f6ed19384dbc91a6f7e2cf4c09fbe7c2ca
+
+permissions:
+  contents: read
+
+jobs:
+  build-combined:
+    name: Combined / ${{ matrix.goos }}-${{ matrix.goarch }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+
+    strategy:
+      fail-fast: false
+      # Preserve ALL five platform targets of the user's successful V5 Action.
+      # Xray is a CLI core; WRB Manager remains Windows-only.
+      matrix:
+        include:
+          - { goos: linux,   goarch: amd64, suffix: linux-amd64,   ext: '' }
+          - { goos: linux,   goarch: arm64, suffix: linux-arm64,   ext: '' }
+          - { goos: windows, goarch: amd64, suffix: windows-amd64, ext: '.exe' }
+          - { goos: darwin,  goarch: amd64, suffix: darwin-amd64,  ext: '' }
+          - { goos: darwin,  goarch: arm64, suffix: darwin-arm64,  ext: '' }
+
+    steps:
+
+      # ======================================================
+      # 1. Checkout repositories
+      # ======================================================
+
+      - name: Checkout original WRR patch repository
+        uses: actions/checkout@v4
+        with:
+          path: patch-repo
+          persist-credentials: false
+
+      - name: Checkout official Xray-core
+        uses: actions/checkout@v4
+        with:
+          repository: XTLS/Xray-core
+          ref: ${{ inputs.xray_ref }}
+          path: xray-core
+          persist-credentials: false
+
+      - name: Checkout pinned AnyTLS implementation
+        uses: actions/checkout@v4
+        with:
+          repository: ynetlab/Xray-core
+          ref: 0721f9b543a6c20f503c1ac181eeb27d98d808f2
+          path: anytls-source
+          persist-credentials: false
+
+      # ======================================================
+      # 2. Verify revisions
+      # ======================================================
+
+      - name: Check source revisions
+        id: revisions
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          expected='0721f9b543a6c20f503c1ac181eeb27d98d808f2'
+          actual="$(git -C anytls-source rev-parse HEAD)"
+
+          if [[ "$actual" != "$expected" ]]; then
+            echo "ERROR: AnyTLS commit mismatch"
+            exit 1
+          fi
+
+          upstream="$(git -C xray-core rev-parse HEAD)"
+          echo "Resolved upstream Xray ref: $upstream"
+
+          echo "upstream=$upstream" >> "$GITHUB_OUTPUT"
+          echo "upstream_short=${upstream:0:12}" >> "$GITHUB_OUTPUT"
+
+          echo "Xray upstream: $upstream"
+          echo "WRR patch repo: $(git -C patch-repo rev-parse HEAD)"
+          echo "AnyTLS commit: $actual"
+
+      # ======================================================
+      # 3. Verify WRR patch script
+      # ======================================================
+
+      - name: Verify original WRR patch script
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          script="$GITHUB_WORKSPACE/patch-repo/scripts/patch_weighted_balancer_with_stats.py"
+
+          if [[ ! -f "$script" ]]; then
+            echo "ERROR: WRR patch script missing: $script"
+            find patch-repo -maxdepth 3 -type f | head -60
+            exit 1
+          fi
+
+          python3 -m py_compile "$script"
+
+          echo "WRR patch script found."
+
+      # ======================================================
+      # 4. Apply WRR + Selection Stats
+      # ======================================================
+
+      - name: Apply original WRR + native selection-counter patch
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Applying WRR + Selection Stats patch..."
+
+          # Must run inside the Xray-core source root.
+          (
+            cd "$GITHUB_WORKSPACE/xray-core"
+
+            test -f go.mod
+
+            python3 "$GITHUB_WORKSPACE/patch-repo/scripts/patch_weighted_balancer_with_stats.py"
+          )
+
+          echo "WRR patch execution completed."
+
+          git -C xray-core add -N .
+          git -C xray-core diff --check
+
+          git -C xray-core diff \
+            --no-ext-diff \
+            --unified=0 \
+            > "$GITHUB_WORKSPACE/wrr-change.patch"
+
+          git -C xray-core diff --name-only \
+            > "$GITHUB_WORKSPACE/wrr-changed-files.txt"
+
+          if [[ ! -s "$GITHUB_WORKSPACE/wrr-changed-files.txt" ]]; then
+            echo "ERROR: WRR patch produced no changes."
+            exit 1
+          fi
+
+          # Verify WRR markers.
+          if ! grep -Eiq \
+            'weighted|wrr|round.?robin' \
+            "$GITHUB_WORKSPACE/wrr-change.patch"; then
+
+            echo "ERROR: WRR changes not detected."
+            exit 1
+          fi
+
+          # Verify Selection Stats markers.
+          if ! grep -Eiq \
+            'selection.{0,80}(stat|count)|(stat|count).{0,80}selection' \
+            "$GITHUB_WORKSPACE/wrr-change.patch"; then
+
+            echo "ERROR: Selection Stats changes not detected."
+            exit 1
+          fi
+
+          {
+            echo "wrr_patch_script=scripts/patch_weighted_balancer_with_stats.py"
+
+            echo "wrr_patch_commit=$(git -C "$GITHUB_WORKSPACE/patch-repo" rev-parse HEAD)"
+
+            echo "wrr_diff_markers=verified"
+            echo "selection_stats_diff_markers=verified"
+
+            echo "changed_files:"
+            cat "$GITHUB_WORKSPACE/wrr-changed-files.txt"
+
+          } > "$GITHUB_WORKSPACE/wrr-validation.txt"
+
+          cat "$GITHUB_WORKSPACE/wrr-validation.txt"
+
+      # All R5.1.7 changes are embedded in THIS YAML (no extra scripts).
+      # The existing myxray/scripts/patch_weighted_balancer_with_stats.py remains
+      # the sole reusable repository patch dependency, as in the known-good V5.
+      - name: Apply R5.1.7 health debounce and Observatory snapshot (inline)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /tmp/r517-health.patch <<'WRB_R517_PATCH'
+          diff --git a/app/router/strategy_weightedroundrobin.go b/app/router/strategy_weightedroundrobin.go
+          --- a/app/router/strategy_weightedroundrobin.go
+          +++ b/app/router/strategy_weightedroundrobin.go
+          @@ -34,6 +34,12 @@
+           	current map[string]float64
+           	rules   []weightedRoundRobinRule
+           
+          +	// Health state is per WRR instance and counts only independent probes.
+          +	// It is intentionally separate from Observatory's raw health state,
+          +	// which other balancers (including DNS) may still need immediately.
+          +	healthMu    sync.Mutex
+          +	healthByTag map[string]wrrHealthState
+          +
+           	statsMu                 sync.Mutex
+           	statsManager            featurestats.Manager
+           	selectionCounters       map[string]featurestats.Counter
+          @@ -44,6 +50,11 @@
+           	match  string
+           	regexp *regexp.Regexp
+           	weight float64
+          +}
+          +
+          +type wrrHealthState struct {
+          +	lastTryTime int64
+          +	failures    uint8
+           }
+           
+           // NewWeightedRoundRobinStrategy creates a smooth weighted round-robin strategy.
+          @@ -55,6 +66,7 @@
+           		FallbackTag:       fallbackTag,
+           		current:           make(map[string]float64),
+           		selectionCounters: make(map[string]featurestats.Counter),
+          +		healthByTag:       make(map[string]wrrHealthState),
+           	}
+           	if settings == nil {
+           		return s, nil
+          @@ -246,19 +258,66 @@
+           
+           	statusMap := make(map[string]*observatory.OutboundStatus, len(result.Status))
+           	for _, outboundStatus := range result.Status {
+          -		statusMap[outboundStatus.OutboundTag] = outboundStatus
+          -	}
+          -	alive := make([]string, 0, len(candidates))
+          -	for _, candidate := range candidates {
+          -		if outboundStatus, found := statusMap[candidate]; found {
+          -			if outboundStatus.Alive {
+          -				alive = append(alive, candidate)
+          +		if outboundStatus != nil && outboundStatus.OutboundTag != "" {
+          +			statusMap[outboundStatus.OutboundTag] = outboundStatus
+          +		}
+          +	}
+          +	return s.filterHealthSnapshots(candidates, statusMap)
+          +}
+          +
+          +// filterHealthSnapshots affects only WRR candidate eligibility. One probe
+          +// failure retains the outbound; two DISTINCT failed LastTryTime values
+          +// exclude it from new selections. A later successful probe restores it.
+          +// Re-reading the same Observatory snapshot must never count as a probe.
+          +// Unknown/missing observation data is allowed, as in original Xray WRR.
+          +func (s *WeightedRoundRobinStrategy) filterHealthSnapshots(candidates []string, statuses map[string]*observatory.OutboundStatus) []string {
+          +	s.healthMu.Lock()
+          +	defer s.healthMu.Unlock()
+          +	if s.healthByTag == nil {
+          +		s.healthByTag = make(map[string]wrrHealthState)
+          +	}
+          +
+          +	eligible := make([]string, 0, len(candidates))
+          +	present := make(map[string]struct{}, len(candidates))
+          +	for _, tag := range candidates {
+          +		present[tag] = struct{}{}
+          +		status, observed := statuses[tag]
+          +		if !observed || status == nil {
+          +			// A newly introduced or no-longer-observed candidate follows
+          +			// Xray's original 'unknown means eligible' convention.
+          +			delete(s.healthByTag, tag)
+          +			eligible = append(eligible, tag)
+          +			continue
+          +		}
+          +
+          +		state := s.healthByTag[tag]
+          +		// LastTryTime is Unix seconds in this Xray generation. Zero is
+          +		// not a trustworthy probe identity. Older/replayed results also
+          +		// must not undo the decision made by a newer independent probe.
+          +		if status.LastTryTime > 0 && status.LastTryTime > state.lastTryTime {
+          +			// WRR is request-driven and may miss Observatory cycles.
+          +			// LastSeenTime records intervening successes even when no
+          +			// connection requested a WRR selection during those cycles.
+          +			// Such a success breaks a would-be consecutive failure run.
+          +			if status.Alive || status.LastSeenTime > state.lastTryTime {
+          +				state.failures = 0
+           			}
+          -		} else {
+          -			// Preserve Xray's existing behavior: candidates without
+          -			// observation data are considered alive.
+          -			alive = append(alive, candidate)
+          -		}
+          -	}
+          -	return alive
+          -}
+          +			if !status.Alive && state.failures < 2 {
+          +				state.failures++
+          +			}
+          +			state.lastTryTime = status.LastTryTime
+          +			s.healthByTag[tag] = state
+          +		}
+          +		if state.failures < 2 {
+          +			eligible = append(eligible, tag)
+          +		}
+          +	}
+          +	// Dynamic balancer updates must not preserve an old tag's health
+          +	// history across removal and later re-addition.
+          +	for tag := range s.healthByTag {
+          +		if _, stillPresent := present[tag]; !stillPresent {
+          +			delete(s.healthByTag, tag)
+          +		}
+          +	}
+          +	return eligible
+          +}
+          diff --git a/app/router/strategy_weightedroundrobin_test.go b/app/router/strategy_weightedroundrobin_test.go
+          --- a/app/router/strategy_weightedroundrobin_test.go
+          +++ b/app/router/strategy_weightedroundrobin_test.go
+          @@ -2,8 +2,10 @@
+           
+           import (
+           	"context"
+          +	"sync"
+           	"testing"
+           
+          +	"github.com/xtls/xray-core/app/observatory"
+           	appstats "github.com/xtls/xray-core/app/stats"
+           )
+           
+          @@ -113,3 +115,130 @@
+           		t.Fatalf("stats-disabled scheduling changed: %#v", counts)
+           	}
+           }
+          +
+          +func healthStatus(tag string, alive bool, at int64) *observatory.OutboundStatus {
+          +	return &observatory.OutboundStatus{OutboundTag: tag, Alive: alive, LastTryTime: at}
+          +}
+          +
+          +func TestWRRHealthDebounceIndependentProbes(t *testing.T) {
+          +	s, err := NewWeightedRoundRobinStrategy(nil, "node-a")
+          +	if err != nil {
+          +		t.Fatal(err)
+          +	}
+          +	candidates := []string{"node-a", "node-b"}
+          +	status := map[string]*observatory.OutboundStatus{
+          +		"node-a": healthStatus("node-a", true, 100),
+          +		"node-b": healthStatus("node-b", true, 100),
+          +	}
+          +	check := func(want int) {
+          +		t.Helper()
+          +		if got := len(s.filterHealthSnapshots(candidates, status)); got != want {
+          +			t.Fatalf("eligible=%d want=%d", got, want)
+          +		}
+          +	}
+          +	check(2)
+          +	status["node-a"] = healthStatus("node-a", false, 115)
+          +	for i := 0; i < 100; i++ {
+          +		check(2)
+          +	} // the same failed probe, many requests
+          +	status["node-a"] = healthStatus("node-a", false, 130)
+          +	check(1)                                             // only node-b remains
+          +	status["node-a"] = healthStatus("node-a", true, 115) // stale result
+          +	check(1)
+          +	status["node-a"] = healthStatus("node-a", true, 145)
+          +	check(2) // restore on a new successful probe
+          +}
+          +
+          +func TestWRRHealthDebounceMissedIntermediateSuccess(t *testing.T) {
+          +	s, err := NewWeightedRoundRobinStrategy(nil, "node-a")
+          +	if err != nil {
+          +		t.Fatal(err)
+          +	}
+          +	candidates := []string{"node-a"}
+          +	status := map[string]*observatory.OutboundStatus{
+          +		"node-a": {OutboundTag: "node-a", Alive: false, LastTryTime: 100, LastSeenTime: 90},
+          +	}
+          +	if got := s.filterHealthSnapshots(candidates, status); len(got) != 1 {
+          +		t.Fatal("first failure should not exclude")
+          +	}
+          +	// WRR was not invoked when a probe succeeded at 110. The last
+          +	// snapshot is a failure at 120 but LastSeenTime proves a success.
+          +	status["node-a"] = &observatory.OutboundStatus{OutboundTag: "node-a", Alive: false, LastTryTime: 120, LastSeenTime: 110}
+          +	if got := s.filterHealthSnapshots(candidates, status); len(got) != 1 {
+          +		t.Fatal("missed success should reset failure count")
+          +	}
+          +	status["node-a"] = &observatory.OutboundStatus{OutboundTag: "node-a", Alive: false, LastTryTime: 135, LastSeenTime: 110}
+          +	if got := s.filterHealthSnapshots(candidates, status); len(got) != 0 {
+          +		t.Fatal("two consecutive failures should exclude")
+          +	}
+          +}
+          +
+          +func TestWRRHealthDebounceFirstFailureAndMissingProbeIdentity(t *testing.T) {
+          +	s, err := NewWeightedRoundRobinStrategy(nil, "node-a")
+          +	if err != nil {
+          +		t.Fatal(err)
+          +	}
+          +	candidates := []string{"node-a"}
+          +	status := map[string]*observatory.OutboundStatus{"node-a": healthStatus("node-a", false, 0)}
+          +	for i := 0; i < 50; i++ {
+          +		if got := s.filterHealthSnapshots(candidates, status); len(got) != 1 {
+          +			t.Fatal("zero-time failure excluded node")
+          +		}
+          +	}
+          +	status["node-a"] = healthStatus("node-a", false, 101)
+          +	if got := s.filterHealthSnapshots(candidates, status); len(got) != 1 {
+          +		t.Fatal("first new failure excluded node")
+          +	}
+          +	status["node-a"] = healthStatus("node-a", false, 116)
+          +	if got := s.filterHealthSnapshots(candidates, status); len(got) != 0 {
+          +		t.Fatal("second new failure did not exclude node")
+          +	}
+          +	status["node-a"] = healthStatus("node-a", true, 0)
+          +	if got := s.filterHealthSnapshots(candidates, status); len(got) != 0 {
+          +		t.Fatal("unidentified stale success recovered node")
+          +	}
+          +	status = map[string]*observatory.OutboundStatus{} // observer has no data
+          +	if got := s.filterHealthSnapshots(candidates, status); len(got) != 1 {
+          +		t.Fatal("unknown candidate must remain eligible")
+          +	}
+          +}
+          +
+          +func TestWRRHealthDebounceReaddAndProxyFallback(t *testing.T) {
+          +	s, err := NewWeightedRoundRobinStrategy(nil, "node-a")
+          +	if err != nil {
+          +		t.Fatal(err)
+          +	}
+          +	status := map[string]*observatory.OutboundStatus{"node-a": healthStatus("node-a", false, 101)}
+          +	s.filterHealthSnapshots([]string{"node-a"}, status)
+          +	status["node-a"] = healthStatus("node-a", false, 116)
+          +	if got := s.filterHealthSnapshots([]string{"node-a"}, status); len(got) != 0 {
+          +		t.Fatal("node should be excluded")
+          +	}
+          +	// The calling balancer uses the Proxy-only fallbackTag when PickOutbound
+          +	// receives zero eligible nodes; this patch does not add DIRECT fallback.
+          +	s.filterHealthSnapshots([]string{"node-b"}, map[string]*observatory.OutboundStatus{})
+          +	if got := s.filterHealthSnapshots([]string{"node-a"}, status); len(got) != 1 {
+          +		t.Fatal("re-added node inherited old failure history")
+          +	}
+          +}
+          +
+          +func TestWRRHealthDebounceConcurrentReaders(t *testing.T) {
+          +	s, err := NewWeightedRoundRobinStrategy(nil, "node-a")
+          +	if err != nil {
+          +		t.Fatal(err)
+          +	}
+          +	status := map[string]*observatory.OutboundStatus{"node-a": healthStatus("node-a", false, 101)}
+          +	var wg sync.WaitGroup
+          +	for i := 0; i < 120; i++ {
+          +		wg.Add(1)
+          +		go func() { defer wg.Done(); s.filterHealthSnapshots([]string{"node-a"}, status) }()
+          +	}
+          +	wg.Wait()
+          +	if got := s.filterHealthSnapshots([]string{"node-a"}, status); len(got) != 1 {
+          +		t.Fatal("same probe was double counted")
+          +	}
+          +	status["node-a"] = healthStatus("node-a", false, 116)
+          +	if got := s.filterHealthSnapshots([]string{"node-a"}, status); len(got) != 0 {
+          +		t.Fatal("independent second failure was not counted")
+          +	}
+          +}
+          diff --git a/app/observatory/observer.go b/app/observatory/observer.go
+          --- a/app/observatory/observer.go
+          +++ b/app/observatory/observer.go
+          @@ -39,7 +39,11 @@
+           }
+           
+           func (o *Observer) GetObservation(ctx context.Context) (proto.Message, error) {
+          -	return &ObservationResult{Status: o.status}, nil
+          +	// Observatory probe writes are protected by statusLock. Return a clone so
+          +	// callers cannot race with updates or mutate the shared health report.
+          +	o.statusLock.Lock()
+          +	defer o.statusLock.Unlock()
+          +	return proto.Clone(&ObservationResult{Status: o.status}), nil
+           }
+           
+           func (o *Observer) Type() interface{} {
+          diff --git a/app/observatory/observer_snapshot_test.go b/app/observatory/observer_snapshot_test.go
+          new file mode 100644
+          --- /dev/null
+          +++ b/app/observatory/observer_snapshot_test.go
+          @@ -0,0 +1,69 @@
+          +package observatory
+          +
+          +import (
+          +	"context"
+          +	"sync"
+          +	"testing"
+          +)
+          +
+          +// An exported report must not alias Observer's mutable backing slice or
+          +// OutboundStatus protobuf pointers.
+          +func TestObserverObservationReadSnapshot(t *testing.T) {
+          +	o := &Observer{status: []*OutboundStatus{{OutboundTag: "node-a", Alive: true, LastTryTime: 100, LastSeenTime: 100}}}
+          +	got, err := o.GetObservation(context.Background())
+          +	if err != nil {
+          +		t.Fatal(err)
+          +	}
+          +	snapshot := got.(*ObservationResult)
+          +	if len(snapshot.Status) != 1 {
+          +		t.Fatalf("status count: %d", len(snapshot.Status))
+          +	}
+          +	if snapshot.Status[0] == o.status[0] {
+          +		t.Fatal("status pointer leaked to reader")
+          +	}
+          +	if &snapshot.Status[0] == &o.status[0] {
+          +		t.Fatal("slice backing array leaked to reader")
+          +	}
+          +	o.statusLock.Lock()
+          +	o.status[0].Alive = false
+          +	o.status[0].LastTryTime = 200
+          +	o.status[0].LastSeenTime = 100
+          +	o.status[0].LastErrorReason = "probe failed"
+          +	o.status = append(o.status, &OutboundStatus{OutboundTag: "node-b"})
+          +	o.statusLock.Unlock()
+          +	if !snapshot.Status[0].Alive || snapshot.Status[0].LastTryTime != 100 || len(snapshot.Status) != 1 {
+          +		t.Fatalf("snapshot was mutated: %#v", snapshot)
+          +	}
+          +}
+          +
+          +// With the old implementation, this test is expected to report a race between
+          +// the probe's locked writes and callers reading the returned live pointers.
+          +func TestObserverObservationConcurrentReadersAndProbeUpdates(t *testing.T) {
+          +	o := &Observer{status: []*OutboundStatus{{OutboundTag: "node-a", Alive: true, LastTryTime: 1}}}
+          +	var wg sync.WaitGroup
+          +	wg.Add(1)
+          +	go func() {
+          +		defer wg.Done()
+          +		for i := 0; i < 2000; i++ {
+          +			o.statusLock.Lock()
+          +			o.status[0].Alive = (i%2 == 0)
+          +			o.status[0].LastTryTime = int64(i + 2)
+          +			o.status[0].LastErrorReason = "changing"
+          +			o.statusLock.Unlock()
+          +		}
+          +	}()
+          +	for i := 0; i < 2000; i++ {
+          +		report, err := o.GetObservation(context.Background())
+          +		if err != nil {
+          +			t.Fatal(err)
+          +		}
+          +		result := report.(*ObservationResult)
+          +		if len(result.Status) != 1 {
+          +			t.Fatalf("status count: %d", len(result.Status))
+          +		}
+          +		_ = result.Status[0].Alive
+          +		_ = result.Status[0].LastTryTime
+          +		_ = result.Status[0].LastErrorReason
+          +	}
+          +	wg.Wait()
+          +}
+          WRB_R517_PATCH
+
+          git -C xray-core apply --check /tmp/r517-health.patch
+          git -C xray-core apply /tmp/r517-health.patch
+          (
+            cd xray-core
+            gofmt -w app/router/strategy_weightedroundrobin.go \
+              app/router/strategy_weightedroundrobin_test.go \
+              app/observatory/observer.go \
+              app/observatory/observer_snapshot_test.go
+            git add -N app/observatory/observer_snapshot_test.go
+            git diff --check
+            grep -q 'filterHealthSnapshots' app/router/strategy_weightedroundrobin.go
+            grep -q 'proto.Clone' app/observatory/observer.go
+          )
+          echo 'R5.1.7 WRR + Observatory fixes applied; originals untouched.'
+
+      # ======================================================
+      # 5. Apply AnyTLS implementation
+      # ======================================================
+
+      - name: Add AnyTLS to WRR-patched Xray
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Applying AnyTLS patch..."
+
+          test -f anytls-source/infra/conf/anytls.go
+          test -f anytls-source/proxy/anytls/config.pb.go
+
+          if [[ -e xray-core/proxy/anytls || -e xray-core/infra/conf/anytls.go ]]; then
+            echo "ERROR: Xray already contains AnyTLS."
+            exit 1
+          fi
+
+          cp -a \
+            anytls-source/proxy/anytls \
+            xray-core/proxy/anytls
+
+          cp \
+            anytls-source/infra/conf/anytls.go \
+            xray-core/infra/conf/anytls.go
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          # Register AnyTLS inbound and outbound.
+          config = Path('xray-core/infra/conf/xray.go')
+
+          text = config.read_text(encoding='utf-8')
+
+          edits = [
+              (
+                  'inboundConfigLoader = NewJSONConfigLoader(ConfigCreatorCache{',
+                  '\n\t\t"anytls": func() interface{} { return new(AnyTLSServerConfig) },',
+              ),
+              (
+                  'outboundConfigLoader = NewJSONConfigLoader(ConfigCreatorCache{',
+                  '\n\t\t"anytls": func() interface{} { return new(AnyTLSClientConfig) },',
+              ),
+          ]
+
+          for anchor, addition in edits:
+              if text.count(anchor) != 1:
+                  raise SystemExit(
+                      f'ERROR: Xray registration anchor changed: {anchor}'
+                  )
+
+              text = text.replace(anchor, anchor + addition, 1)
+
+          config.write_text(text, encoding='utf-8')
+
+          # Register the AnyTLS runtime implementation.
+          imports = Path('xray-core/main/distro/all/all.go')
+
+          text = imports.read_text(encoding='utf-8')
+
+          anchor = '_ "github.com/xtls/xray-core/proxy/blackhole"'
+
+          if text.count(anchor) != 1:
+              raise SystemExit(
+                  'ERROR: Xray distro import anchor changed'
+              )
+
+          text = text.replace(
+              anchor,
+              '_ "github.com/xtls/xray-core/proxy/anytls"\n\t' + anchor,
+              1
+          )
+
+          imports.write_text(text, encoding='utf-8')
+          PY
+
+          cd xray-core
+
+          gofmt -w \
+            infra/conf/xray.go \
+            infra/conf/anytls.go \
+            main/distro/all/all.go \
+            proxy/anytls/*.go
+
+          git add -N infra/conf/anytls.go proxy/anytls
+
+          git diff --check
+
+          echo "AnyTLS source files applied."
+          git diff --stat
+
+      # ======================================================
+      # 6. Setup Go
+      # ======================================================
+
+      - name: Set up Go from Xray go.mod
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: xray-core/go.mod
+          cache: true
+          cache-dependency-path: xray-core/go.sum
+
+      # ======================================================
+      # 7. Download GeoData and run Go tests
+      #
+      # V5 FIX:
+      # Xray routing tests require resources/geosite.dat.
+      # Download the official GeoData and verify SHA256.
+      #
+      # Tests run on Linux AMD64 only.
+      # ======================================================
+
+      - name: Download GeoData and test AnyTLS + WRR + routing
+        if: matrix.goos == 'linux' && matrix.goarch == 'amd64'
+        working-directory: xray-core
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "========================================"
+          echo "Downloading official Xray GeoData"
+          echo "========================================"
+
+          mkdir -p resources
+
+          BASE_URL="https://github.com/XTLS/Xray-rules-dat/releases/latest/download"
+
+          # Download GeoSite standard database.
+          curl -fL --retry 3 \
+            "$BASE_URL/geosite.dat" \
+            -o resources/geosite.dat
+
+          curl -fL --retry 3 \
+            "$BASE_URL/geosite.dat.sha256sum" \
+            -o resources/geosite.dat.sha256sum
+
+          # Download GeoIP Lite database.
+          curl -fL --retry 3 \
+            "$BASE_URL/geoip-lite.dat" \
+            -o resources/geoip-lite.dat
+
+          curl -fL --retry 3 \
+            "$BASE_URL/geoip-lite.dat.sha256sum" \
+            -o resources/geoip-lite.dat.sha256sum
+
+          echo "========================================"
+          echo "Verifying GeoData SHA256"
+          echo "========================================"
+
+          (
+            cd resources
+
+            # Verify original filenames first.
+            sha256sum -c geosite.dat.sha256sum
+            sha256sum -c geoip-lite.dat.sha256sum
+
+            # Rename GeoIP Lite to the filename Xray expects.
+            mv geoip-lite.dat geoip.dat
+          )
+
+          test -s resources/geosite.dat
+          test -s resources/geoip.dat
+
+          echo "GeoData download and verification successful."
+
+          ls -lh resources/geosite.dat resources/geoip.dat
+
+          echo "========================================"
+          echo "Downloading Go dependencies"
+          echo "========================================"
+
+          go mod download
+
+          echo "========================================"
+          echo "Testing AnyTLS package"
+          echo "========================================"
+
+          go test ./proxy/anytls -count=1
+
+          echo "========================================"
+          echo "Testing WRR + Selection Stats + routing"
+          echo "========================================"
+
+          go test ./app/router ./app/observatory ./infra/conf -count=1
+
+          echo "========================================"
+          echo "Race tests: WRR and Observatory"
+          echo "========================================"
+          CGO_ENABLED=1 go test -race ./app/router ./app/observatory -count=1
+
+          echo "========================================"
+          echo "Vet: WRR, Observatory, AnyTLS and routing"
+          echo "========================================"
+          go vet ./app/router ./app/observatory ./infra/conf ./proxy/anytls
+
+          echo "========================================"
+          echo "All Go tests passed"
+          echo "========================================"
+
+      # ======================================================
+      # 8. Build binaries
+      # ======================================================
+
+      - name: Compile Xray with WRR + Stats + AnyTLS
+        working-directory: xray-core
+        shell: bash
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: '0'
+          XRAY_REF: ${{ inputs.xray_ref }}
+        run: |
+          set -euo pipefail
+
+          echo "Building for $GOOS/$GOARCH"
+
+          mkdir -p dist
+
+          binary="dist/xray-wrr-anytls-r517-${{ matrix.suffix }}${{ matrix.ext }}"
+
+          go build \
+            -trimpath \
+            -buildvcs=false \
+            -ldflags='-s -w -buildid=' \
+            -o "$binary" \
+            ./main
+
+          sha256sum "$binary" > "$binary.sha256"
+
+          # Record source revision information.
+          {
+            echo "upstream_repo=XTLS/Xray-core"
+            echo "upstream_ref=$XRAY_REF"
+            echo "upstream_commit=${{ steps.revisions.outputs.upstream }}"
+
+            echo "anytls_source_repo=ynetlab/Xray-core"
+            echo "anytls_source_commit=0721f9b543a6c20f503c1ac181eeb27d98d808f2"
+
+            echo "wrr_patch=patch-repo/scripts/patch_weighted_balancer_with_stats.py"
+            echo "selection_stats=source_diff_verified"
+            echo "health_debounce=2_independent_failed_probes"
+            echo "observatory_snapshot=proto_clone_under_status_lock"
+            echo "r517_inline_patch_sha256=$(sha256sum /tmp/r517-health.patch | cut -d ' ' -f 1)"
+
+            echo "wrr_patch_commit=$(git -C ../patch-repo rev-parse HEAD)"
+
+            cat ../wrr-validation.txt
+
+          } > "dist/build-info-${{ matrix.suffix }}.txt"
+
+          echo "Build completed: $binary"
+
+      # ======================================================
+      # 9. Smoke-test AnyTLS configuration
+      # ======================================================
+
+      - name: Smoke-test AnyTLS outbound config
+        if: matrix.goos == 'linux' && matrix.goarch == 'amd64'
+        working-directory: xray-core
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Checking compiled Xray version..."
+
+          dist/xray-wrr-anytls-r517-linux-amd64 version
+
+          echo "Creating AnyTLS test configuration..."
+
+          cat > /tmp/anytls-client-test.json <<'JSON'
+          {
+            "log": {
+              "loglevel": "warning"
+            },
+            "outbounds": [
+              {
+                "protocol": "anytls",
+                "settings": {
+                  "address": "example.com",
+                  "port": 443,
+                  "password": "ci-test-only-password"
+                },
+                "streamSettings": {
+                  "network": "tcp",
+                  "security": "tls",
+                  "tlsSettings": {
+                    "serverName": "example.com"
+                  }
+                }
+              }
+            ]
+          }
+          JSON
+
+          dist/xray-wrr-anytls-r517-linux-amd64 \
+            run -test \
+            -c /tmp/anytls-client-test.json
+
+          echo "AnyTLS outbound configuration validation passed."
+
+      # ======================================================
+      # 10. Upload artifacts
+      # ======================================================
+
+      - name: Upload platform artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: xray-wrr-anytls-r517-${{ matrix.suffix }}-${{ steps.revisions.outputs.upstream_short }}
+          path: |
+            wrr-validation.txt
+            xray-core/dist/xray-wrr-anytls-r517-${{ matrix.suffix }}${{ matrix.ext }}
+            xray-core/dist/xray-wrr-anytls-r517-${{ matrix.suffix }}${{ matrix.ext }}.sha256
+            xray-core/dist/build-info-${{ matrix.suffix }}.txt
+          if-no-files-found: error
+          retention-days: 14
