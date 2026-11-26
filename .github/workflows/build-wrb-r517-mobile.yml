@@ -1016,9 +1016,21 @@ jobs:
           go get golang.org/x/mobile/bind@v0.0.0-20261011034528-197770444867
           go mod verify
           gofmt -w bridge.go
-          gomobile bind -v -target=android/arm,android/arm64,android/amd64 -androidapi 24 -trimpath -ldflags='-s -w -buildid= -checklinkname=0' -o ../android-dist/libv2ray.aar .
+          # Explicitly align native shared-library PT_LOAD segments for 16 KiB Android.
+          export CGO_LDFLAGS="-Wl,-z,max-page-size=16384"
+          gomobile bind -v -target=android/arm,android/arm64,android/amd64 -androidapi 24 -trimpath -ldflags='-s -w -buildid= -checklinkname=0 -extldflags=-Wl,-z,max-page-size=16384' -o ../android-dist/libv2ray.aar .
           cd ../android-dist
           for abi in armeabi-v7a arm64-v8a x86_64; do unzip -Z1 libv2ray.aar | grep -Fx "jni/$abi/libgojni.so"; done
+          # Fail the build if either 64-bit ABI has a 4 KiB ELF load segment.
+          for abi in arm64-v8a x86_64; do
+            unzip -p libv2ray.aar "jni/$abi/libgojni.so" > "/tmp/wrb-$abi.so"
+            readelf -lW "/tmp/wrb-$abi.so" | tee "elf-$abi.txt"
+            python3 - "elf-$abi.txt" <<'PY'
+          import sys
+          rows=[s.split() for s in open(sys.argv[1]) if s.strip().startswith("LOAD ")]
+          assert rows and all(int(r[-1],16)>=16384 for r in rows), "16 KiB PT_LOAD alignment required"
+          PY
+          done
           unzip -p libv2ray.aar classes.jar > /tmp/wrb-classes.jar
           jar tf /tmp/wrb-classes.jar | grep -Fx 'libv2ray/Libv2ray.class'
           javap -classpath /tmp/wrb-classes.jar libv2ray.Libv2ray libv2ray.CoreController > java-api.txt
@@ -1031,6 +1043,7 @@ jobs:
             echo 'anytls_source_commit=0721f9b543a6c20f503c1ac181eeb27d98d808f2'
             echo 'health_debounce=2_independent_failed_probes'
             echo 'android_adapter=WRB-R517'
+            echo 'elf_64bit_min_load_alignment=16384'
             echo 'gomobile=v0.0.0-20261011034528-197770444867'
             echo "r517_inline_patch_sha256=$(sha256sum /tmp/r517-health.patch | cut -d ' ' -f 1)"
             echo "ndk=$NDK_VERSION"
