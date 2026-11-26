@@ -925,6 +925,12 @@ jobs:
           distribution: temurin
           java-version: '17'
 
+      - name: Provision Android SDK command line tools
+        if: matrix.goos == 'android'
+        uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407
+        with:
+          packages: 'platform-tools platforms;android-35 build-tools;35.0.0 ndk;27.2.12479018'
+
       - name: Build Android R517 AAR using same patched Xray tree
         if: matrix.goos == 'android'
         shell: bash
@@ -933,7 +939,8 @@ jobs:
           NDK_VERSION=27.2.12479018
           SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:?Android SDK missing}}"
           export ANDROID_HOME="$SDK_ROOT"
-          sdkmanager --install "platforms;android-35" "ndk;$NDK_VERSION"
+          command -v sdkmanager
+          test -d "$SDK_ROOT/ndk/$NDK_VERSION"
           export ANDROID_NDK_HOME="$SDK_ROOT/ndk/$NDK_VERSION"
           export PATH="$(go env GOPATH)/bin:$PATH"
           go install golang.org/x/mobile/cmd/gomobile@v0.0.0-20261011034528-197770444867
@@ -1005,6 +1012,8 @@ jobs:
           go mod edit -go=1.27 -require=github.com/xtls/xray-core@v0.0.0 -replace=github.com/xtls/xray-core=../xray-core
           go mod edit -require=golang.org/x/mobile@v0.0.0-20261011034528-197770444867
           go mod tidy
+          # gomobile's generated wrappers import bind/seq; keep its pinned dependency.
+          go get golang.org/x/mobile/bind@v0.0.0-20261011034528-197770444867
           go mod verify
           gofmt -w bridge.go
           gomobile bind -v -target=android/arm,android/arm64,android/amd64 -androidapi 24 -trimpath -ldflags='-s -w -buildid= -checklinkname=0' -o ../android-dist/libv2ray.aar .
